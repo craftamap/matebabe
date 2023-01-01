@@ -47,6 +47,7 @@ pub enum Constant {
     NameAndType(String, String),
     InvokeDynamic(u16, Box<crate::parse::Constant>),
     MethodHandle(RefKind, Box<crate::parse::Constant>),
+    Integer(i32),
     Placeholder,
 }
 
@@ -185,12 +186,15 @@ fn parse_or_get_constant(
             // FIXME: decide which kind of reference to resolve using RefKind
             // FIXME: somehow check the class file version number for version specific behaviour
 
-            let methodref_or_interface_method_ref = parse_or_get_constant(
-                constant_pool,
-                deserialized_constant_pool,
-                *reference_index,
-            )?;
-            Constant::MethodHandle(RefKind::InvokeStatic, methodref_or_interface_method_ref.into())
+            let methodref_or_interface_method_ref =
+                parse_or_get_constant(constant_pool, deserialized_constant_pool, *reference_index)?;
+            Constant::MethodHandle(
+                RefKind::InvokeStatic,
+                methodref_or_interface_method_ref.into(),
+            )
+        }
+        CPInfo::ConstantIntegerInfo { tag, bytes } => {
+            Constant::Integer(Cursor::new(bytes.to_be_bytes()).read_i32::<BigEndian>()?)
         }
     };
 
@@ -283,6 +287,7 @@ pub fn parse_field_descriptor(field_descriptor: String) -> Result<FieldDescripto
 #[derive(Debug, Clone)]
 pub enum FieldType {
     Integer,
+    LongInteger,
     ClassInstance(String),
     Array(Box<FieldType>),
 }
@@ -297,6 +302,7 @@ fn parse_field_type(chars: &mut Chars) -> Result<FieldType, Box<dyn Error>> {
         )),
         '[' => Ok(FieldType::Array(Box::new(parse_field_type(chars)?))),
         'I' => Ok(FieldType::Integer),
+        'J' => Ok(FieldType::LongInteger),
         _ => unreachable!(),
     }
 }
@@ -429,7 +435,7 @@ pub struct Class {
     pub access: Access,
     pub constant_pool: Vec<Constant>,
     pub this_class: ClassInfo,
-    pub super_class: ClassInfo,
+    pub super_class: Option<ClassInfo>,
     pub interfaces: Vec<ClassInfo>,
     pub fields: Vec<Field>,
     pub methods: Vec<Method>,
@@ -452,16 +458,23 @@ pub fn parse(class_file: DeserializedClassFile) -> Result<Class, Box<dyn Error>>
     .as_class()
     .ok_or("no  class")?
     .to_owned();
-    println!("{this_class:?}");
-    let super_class = parse_or_get_constant(
-        &mut constant_pool,
-        &class_file.constant_pool,
-        class_file.super_class,
-    )?
-    .as_class()
-    .ok_or("no class")?
-    .to_owned();
-    println!("{super_class:?}");
+    println!("this_class: {this_class:?}");
+
+    let super_class = if (class_file.super_class == 0) {
+        // if super_class is 0, this is most likely java.lang.Object
+        None
+    } else {
+        Some(
+            parse_or_get_constant(
+                &mut constant_pool,
+                &class_file.constant_pool,
+                class_file.super_class,
+            )?
+            .as_class()
+            .ok_or("no class")?
+            .to_owned(),
+        )
+    };
 
     let mut interfaces = vec![];
     for interface_index in class_file.interfaces.iter() {

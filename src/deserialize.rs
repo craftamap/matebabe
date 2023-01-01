@@ -50,6 +50,11 @@ pub enum CPInfo {
         tag: u8,
         string_index: u16,
     },
+    // https://docs.oracle.com/javase/specs/jvms/se11/html/jvms-4.html#jvms-4.4.4
+    ConstantIntegerInfo {
+        tag: u8,
+        bytes: u32,
+    },
     // https://docs.oracle.com/javase/specs/jvms/se11/html/jvms-4.html#jvms-4.4.6
     ConstantNameAndTypeInfo {
         tag: u8,
@@ -119,6 +124,11 @@ fn deserialize_constant_pool(rdr: &mut Cursor<Vec<u8>>) -> Result<CPInfo, Box<dy
                 length,
                 bytes: buf,
             })
+        }
+        // CONSTANT_Integer
+        3 => {
+            let bytes = rdr.read_u32::<BigEndian>()?;
+            Ok(CPInfo::ConstantIntegerInfo { tag, bytes })
         }
         // CONSTANT_Class
         7 => {
@@ -208,8 +218,8 @@ fn deserialize_attributes(
     return Ok(attributes);
 }
 
-pub fn deserialize_class_file(name: String) -> Result<DeserializedClassFile, Box<dyn Error>> {
-    let f = File::open(name + ".class")?;
+pub fn deserialize_class_file(path: String) -> Result<DeserializedClassFile, Box<dyn Error>> {
+    let f = File::open(path)?;
     let mut reader = BufReader::new(f);
     let mut buffer = Vec::new();
 

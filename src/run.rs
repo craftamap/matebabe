@@ -1,7 +1,9 @@
 use std::{
     collections::HashMap,
     error::Error,
+    fs::File,
     io::Cursor,
+    path::Path,
     rc::{Rc, Weak},
     vec,
 };
@@ -241,7 +243,7 @@ impl Frame {
                                     .read_i32::<BigEndian>()?;
                                 println!("\x1b[93mOUT:\x1b[0m {}", integer);
                             }
-                            crate::parse::FieldType::Array(_) => todo!(),
+                            _ => todo!(),
                         }
                     } else {
                         return Err("no ugly workaround for this method :(".into());
@@ -321,9 +323,44 @@ impl VM {
     }
 
     fn load_class(&mut self, name: String) -> Result<(), Box<dyn Error>> {
-        let deserialized = deserialize_class_file(name.to_owned())?;
+        if self
+            .global_memory
+            .method_area
+            .class_specific_data
+            .contains_key(&name)
+        {
+            println!("class already loaded, skipping");
+            return Ok(());
+        }
+        // Look for class in (hardcoded) classpath
+        let class_path = vec![
+            ".",
+            "/tmp/jdk11u/build/linux-x86_64-normal-server-release/jdk/modules/java.base",
+        ];
+
+        let mut path = None;
+        for directory in class_path.iter() {
+            let potential_path = Path::new(directory).join(name.to_owned() + ".class");
+            if potential_path.exists() {
+                path = Some(potential_path)
+            }
+        }
+        let spath = path
+            .ok_or("file not found")?
+            .to_str()
+            .ok_or("not a path")?
+            .to_string();
+        println!("spath: {spath}");
+
+        let deserialized = deserialize_class_file(spath)?;
 
         let class = parse(deserialized)?;
+
+        if let Some(ref class) = class.super_class {
+            println!("found super class {class:?}, loading it!");
+            self.load_class(class.name.to_owned())?;
+        }
+
         let mut pool = vec![];
         for item in class.constant_pool.iter() {
             match item {
