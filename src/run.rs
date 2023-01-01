@@ -18,6 +18,8 @@ use crate::{
 #[derive(Debug)]
 struct ThreadMemory {
     jvm_stack: Vec<Frame>,
+    program_counter: usize, // unused, as we use ic for now :^) might get relevant when we allow
+                            // frame switching?
 }
 
 #[derive(Debug)]
@@ -26,17 +28,58 @@ struct Frame {
     operand_stack: Vec<u32>,
     constant_pool: Weak<RuntimeConstantPool>,
     code_bytes: Vec<u8>,
-    program_counter: usize, // unused, as we use ic for now :^) might get relevant when we allow
-                            // frame switching?
 }
 
 impl Frame {
+    fn new(
+        global_memory: &mut GlobalMemory,
+        class_name: String,
+        method_name: String,
+    ) -> Result<Frame, Box<dyn Error>> {
+        let current_class = global_memory
+            .method_area
+            .class_specific_data
+            .get(&class_name)
+            .ok_or("Class not found :(")?;
+
+        let current_method = current_class
+            .parsed_class
+            .methods
+            .iter()
+            .filter(|method| method.name == method_name)
+            .next()
+            .ok_or("methodnotfound :(")?;
+
+        let code = current_method
+            .attributes
+            .iter()
+            .filter(|attr| matches!(attr, Attribute::Code { .. }))
+            .next()
+            .ok_or("no code :(")?;
+
+        let code_bytes = code.as_code().ok_or("no code :(")?;
+        let current_frame = Frame {
+            constant_pool: Rc::downgrade(&current_class.constant_pool.to_owned()),
+            local_variables: vec![0; 20],
+            operand_stack: vec![],
+            code_bytes: code_bytes.to_owned(),
+        };
+        return Ok(current_frame);
+    }
+
     fn run(&mut self, global_memory: &mut GlobalMemory) -> Result<(), Box<dyn Error>> {
         let mut ic = 0;
         while ic < self.code_bytes.len() {
             let instruction = self.code_bytes.get(ic).ok_or("no bytes")?;
-            println!("instruction: {instruction:0x}");
+            println!("instruction: {instruction:#0x}");
             match instruction {
+                // iconst_i
+                instruction @ (0x2 | 0x3 | 0x4 | 0x5 | 0x6 | 0x7 | 0x8) => {
+                    let topush = *instruction as i32 - 0x3;
+                    self.operand_stack
+                        .push(Cursor::new(topush.to_be_bytes()).read_u32::<BigEndian>()?);
+                    ic += 1;
+                }
                 // bipush
                 0x10 => {
                     ic += 1;
@@ -88,6 +131,13 @@ impl Frame {
 
                     ic += 1;
                 }
+                // aload_n
+                instruction @ (0x2a | 0x2b | 0x2c | 0x2d) => {
+                    let integer = self.local_variables[(instruction - 0x2a) as usize];
+                    self.operand_stack.push(integer);
+
+                    ic += 1;
+                }
                 // istore
                 0x36 => {
                     ic += 1;
@@ -107,6 +157,16 @@ impl Frame {
                         .pop()
                         .ok_or("no item on the operand_stack")?;
                     self.local_variables[(instruction - 0x3b) as usize] = integer;
+
+                    ic += 1;
+                }
+                // astore_n
+                instruction @ (0x4b | 0x4c | 0x4d | 0x4e) => {
+                    let reference = self
+                        .operand_stack
+                        .pop()
+                        .ok_or("no item on the operand_stack")?;
+                    self.local_variables[(instruction - 0x4b) as usize] = reference;
 
                     ic += 1;
                 }
@@ -136,14 +196,72 @@ impl Frame {
                         .operand_stack
                         .pop()
                         .ok_or("no item on the operand_stack")?;
-                    let v2 = Cursor::new(value2.to_be_bytes()).read_i32::<BigEndian>()?;
-                    let v1 = Cursor::new(value1.to_be_bytes()).read_i32::<BigEndian>()?;
-                    println!("v1 is {v1} and v2 is {v2}");
-                    let result = v1 - v2;
+                    let result = Cursor::new(value1.to_be_bytes()).read_i32::<BigEndian>()?
+                        - Cursor::new(value2.to_be_bytes()).read_i32::<BigEndian>()?;
                     println!("result is {result}");
                     self.operand_stack
                         .push(Cursor::new(result.to_be_bytes()).read_u32::<BigEndian>()?);
                     ic += 1;
+                }
+                // iinc
+                0x84 => {
+                    ic += 1;
+                    let index = *self.code_bytes.get(ic).ok_or("no bytes")?;
+                    ic += 1;
+                    let the_const = (*self.code_bytes.get(ic).ok_or("no bytes")?) as i32;
+
+                    let value = Cursor::new(
+                        self.local_variables
+                            .get(index as usize)
+                            .ok_or("no variable in local storage index")?
+                            .to_be_bytes(),
+                    )
+                    .read_i32::<BigEndian>()?;
+                    let new_value = value + the_const;
+                    self.local_variables[index as usize] =
+                        Cursor::new(new_value.to_be_bytes()).read_u32::<BigEndian>()?;
+                    ic += 1;
+                }
+                // if_icmpge
+                0xa2 => {
+                    ic += 1;
+                    let branchbyte1 = (*self.code_bytes.get(ic).ok_or("no bytes")?) as u16;
+                    ic += 1;
+                    let branchbyte2 = (*self.code_bytes.get(ic).ok_or("no bytes")?) as u16;
+
+                    let branchoffset =
+                        Cursor::new(((branchbyte1 << 8) | branchbyte2).to_be_bytes())
+                            .read_i16::<BigEndian>()?;
+
+                    let value2 = self
+                        .operand_stack
+                        .pop()
+                        .ok_or("no item on the operand_stack")?;
+                    let value1 = self
+                        .operand_stack
+                        .pop()
+                        .ok_or("no item on the operand_stack")?;
+                    let result = Cursor::new(value1.to_be_bytes()).read_i32::<BigEndian>()?
+                        >= Cursor::new(value2.to_be_bytes()).read_i32::<BigEndian>()?;
+
+                    if result {
+                        ic = ic - 2 + branchoffset as usize;
+                    } else {
+                        ic += 1;
+                    }
+                }
+                // goto
+                0xa7 => {
+                    ic += 1;
+                    let branchbyte1 = (*self.code_bytes.get(ic).ok_or("no bytes")?) as u16;
+                    ic += 1;
+                    let branchbyte2 = (*self.code_bytes.get(ic).ok_or("no bytes")?) as u16;
+
+                    let branchoffset =
+                        Cursor::new(((branchbyte1 << 8) | branchbyte2).to_be_bytes())
+                            .read_i16::<BigEndian>()?;
+                    println!("offset: {branchoffset}");
+                    ic = ((ic - 2) as isize + branchoffset as isize) as usize;
                 }
                 // return
                 0xb1 => {
@@ -251,8 +369,54 @@ impl Frame {
 
                     ic += 1;
                 }
+                // invokestatic
+                0xb8 => {
+                    ic += 1;
+                    let indexbyte1 = (*self.code_bytes.get(ic).ok_or("no bytes")?) as u16;
+                    ic += 1;
+                    let indexbyte2 = (*self.code_bytes.get(ic).ok_or("no bytes")?) as u16;
 
-                i @ _ => return Err(format!("unknown instruction {i}").into()),
+                    let index = (indexbyte1 << 8) | indexbyte2;
+
+                    let (class_info, name_and_type) = self
+                        .constant_pool
+                        .clone()
+                        .upgrade()
+                        .ok_or("no constant_pool")?
+                        .pool
+                        .get((index - 1) as usize)
+                        .ok_or("expected ur mom")?
+                        .to_owned()
+                        .as_method_ref()
+                        .ok_or("not a field ref")?;
+                    let (name, method_descriptor_text) = name_and_type
+                        .as_name_and_type()
+                        .ok_or("not a NameAndType")?;
+                    let type_descriptor = parse_method_descriptor(method_descriptor_text)?;
+                    println!("type_descriptor: {type_descriptor:?}");
+                    let mut nargs = vec![];
+
+                    // this loop is probably incorrect, as doubles and stuff take up 2 bytes
+                    for _ in 0..type_descriptor.parameter_descriptors.len() {
+                        let narg = self
+                            .operand_stack
+                            .pop()
+                            .ok_or("nargs is not on the stack")?;
+                        nargs.insert(0, narg);
+                    }
+
+                    // this feels wrong - we probably want to deletegate this to vm?
+                    let mut new_frame = Frame::new(global_memory, class_info.name, name)?;
+                    // FIXME: this probably doesnt handle longs correctly?
+                    for narg in nargs.iter().enumerate() {
+                        new_frame.local_variables[narg.0] = *narg.1;
+                    }
+                    println!("ENTERING THE NEW FRAME!!");
+                    new_frame.run(global_memory)?;
+                    ic += 1;
+                }
+
+                i @ _ => return Err(format!("unknown instruction {i:#0x}").into()),
             }
 
             println!("vm: {:?} {:?}", self, global_memory.heap)
@@ -318,6 +482,7 @@ impl VM {
             },
             thread_memory: ThreadMemory {
                 jvm_stack: Vec::new(),
+                program_counter: 0,
             },
         }
     }
@@ -385,38 +550,8 @@ impl VM {
     }
 
     fn run(&mut self, name: String) -> Result<(), Box<dyn Error>> {
-        self.load_class(name.to_owned())?;
-
-        let current_class = self
-            .global_memory
-            .method_area
-            .class_specific_data
-            .get(&name)
-            .ok_or("Class not found :(")?;
-
-        let current_method = current_class
-            .parsed_class
-            .methods
-            .iter()
-            .filter(|method| method.name == "main")
-            .next()
-            .ok_or("methodnotfound :(")?;
-
-        let code = current_method
-            .attributes
-            .iter()
-            .filter(|attr| matches!(attr, Attribute::Code { .. }))
-            .next()
-            .ok_or("no code :(")?;
-
-        let code_bytes = code.as_code().ok_or("no code :(")?;
-        let current_frame = Frame {
-            constant_pool: Rc::downgrade(&current_class.constant_pool.to_owned()),
-            local_variables: vec![0; 10],
-            operand_stack: vec![],
-            program_counter: 0,
-            code_bytes: code_bytes.to_owned(),
-        };
+        self.load_class(name.to_owned());
+        let current_frame = Frame::new(&mut self.global_memory, name, "main".into())?;
         self.thread_memory.jvm_stack.push(current_frame);
 
         let current_frame = self
@@ -433,6 +568,6 @@ impl VM {
 
 pub fn run(filename: String) {
     let mut rt = VM::new();
-    let class_name = filename.trim_end_matches(".class");
+    let class_name = filename;
     rt.run(class_name.to_owned()).unwrap();
 }
