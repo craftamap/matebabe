@@ -62,7 +62,18 @@ pub enum CPInfo {
         length: u16,
         bytes: Vec<u8>,
     },
+    // https://docs.oracle.com/javase/specs/jvms/se11/html/jvms-4.html#jvms-4.4.8
+    ConstantMethodHandleInfo {
+        tag: u8,
+        reference_kind: u8,
+        reference_index: u16,
+    },
     // https://docs.oracle.com/javase/specs/jvms/se11/html/jvms-4.html#jvms-4.4.10
+    ConstantInvokeDynamicInfo {
+        tag: u8,
+        bootstrap_method_attr_index: u16,
+        name_and_type_index: u16,
+    },
 }
 
 #[derive(Debug)]
@@ -152,6 +163,24 @@ fn deserialize_constant_pool(rdr: &mut Cursor<Vec<u8>>) -> Result<CPInfo, Box<dy
                 tag,
                 name_index,
                 descriptor_index,
+            })
+        }
+        15 => {
+            let reference_kind = rdr.read_u8()?;
+            let reference_index = rdr.read_u16::<BigEndian>()?;
+            Ok(CPInfo::ConstantMethodHandleInfo {
+                tag,
+                reference_kind,
+                reference_index,
+            })
+        }
+        18 => {
+            let bootstrap_method_attr_index = rdr.read_u16::<BigEndian>()?;
+            let name_and_type_index = rdr.read_u16::<BigEndian>()?;
+            Ok(CPInfo::ConstantInvokeDynamicInfo {
+                tag,
+                bootstrap_method_attr_index,
+                name_and_type_index,
             })
         }
         _ => todo!(),

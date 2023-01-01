@@ -31,6 +31,12 @@ fn parse_access_flags(access_flags: u16) -> Access {
     };
 }
 
+// https://docs.oracle.com/javase/specs/jvms/se11/html/jvms-5.html#jvms-5.4.3.5-220
+#[derive(Clone, Debug)]
+pub enum RefKind {
+    InvokeStatic,
+}
+
 #[derive(Clone, Debug)]
 pub enum Constant {
     Class(ClassInfo),
@@ -39,6 +45,8 @@ pub enum Constant {
     MethodRef(ClassInfo, Box<crate::parse::Constant>),
     FieldRef(ClassInfo, Box<crate::parse::Constant>),
     NameAndType(String, String),
+    InvokeDynamic(u16, Box<crate::parse::Constant>),
+    MethodHandle(RefKind, Box<crate::parse::Constant>),
     Placeholder,
 }
 
@@ -155,6 +163,35 @@ fn parse_or_get_constant(
             Constant::NameAndType(name.to_owned(), descriptor_text.to_owned())
         }
         info @ CPInfo::ConstantUtf8Info { .. } => Constant::Utf8(parse_utf8_info(info)),
+        CPInfo::ConstantInvokeDynamicInfo {
+            tag,
+            bootstrap_method_attr_index,
+            name_and_type_index,
+        } => {
+            let name_and_type = parse_or_get_constant(
+                constant_pool,
+                deserialized_constant_pool,
+                *name_and_type_index,
+            )?;
+
+            Constant::InvokeDynamic(bootstrap_method_attr_index.to_owned(), name_and_type.into())
+        }
+        info @ CPInfo::ConstantMethodHandleInfo {
+            tag,
+            reference_kind,
+            reference_index,
+        } => {
+            // FIXME: Derive RefKind from reference_kind
+            // FIXME: decide which kind of reference to resolve using RefKind
+            // FIXME: somehow check the class file version number for version specific behaviour
+
+            let methodref_or_interface_method_ref = parse_or_get_constant(
+                constant_pool,
+                deserialized_constant_pool,
+                *reference_index,
+            )?;
+            Constant::MethodHandle(RefKind::InvokeStatic, methodref_or_interface_method_ref.into())
+        }
     };
 
     constant_pool[(index - 1) as usize] = constant.to_owned();
