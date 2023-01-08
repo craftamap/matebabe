@@ -9,26 +9,61 @@ use byteorder::{BigEndian, ReadBytesExt};
 use crate::deserialize::{AttributeInfo, CPInfo, DeserializedClassFile, FieldInfo, MethodInfo};
 
 #[derive(Debug)]
-pub struct Access {
+pub struct ClassAccess {
     pub public: bool,
     pub is_final: bool,
     pub is_super: bool,
     pub interface: bool,
 }
 
-fn parse_access_flags(access_flags: u16) -> Access {
+fn parse_access_flags(access_flags: u16) -> ClassAccess {
     let public = access_flags & 0x0001 == 0x0001;
     let is_final = access_flags & 0x0010 == 0x0010;
     let is_super = access_flags & 0x0020 == 0x0020;
     let interface = access_flags & 0x0200 == 0x0200;
     // TODO: add remaining access flags!
 
-    return Access {
+    return ClassAccess {
         public,
         is_final,
         is_super,
         interface,
     };
+}
+
+#[derive(Debug)]
+pub struct FieldAccess {
+    pub public: bool,
+    pub private: bool,
+    pub protected: bool,
+    pub r#static: bool,
+    pub r#final: bool,
+    pub volatile: bool,
+    pub transient: bool,
+    pub synthetic: bool,
+    pub r#enum: bool,
+}
+
+impl FieldAccess {
+    fn new(access_flags: u16) -> FieldAccess {
+        let public = access_flags & 0x0001 == 0x0001;
+        let private = access_flags & 0x0002 == 0x0002;
+        let protected = access_flags & 0x0004 == 0x0004;
+        let r#static = access_flags & 0x0008 == 0x0008;
+        // TODO: add remaining access flags!
+
+        return FieldAccess {
+            public,
+            private,
+            protected,
+            r#static,
+            r#final: false,
+            volatile: false,
+            transient: false,
+            synthetic: false,
+            r#enum: false,
+        };
+    }
 }
 
 // https://docs.oracle.com/javase/specs/jvms/se11/html/jvms-5.html#jvms-5.4.3.5-220
@@ -47,12 +82,14 @@ pub enum Constant {
     NameAndType(String, String),
     InvokeDynamic(u16, Box<crate::parse::Constant>),
     MethodHandle(RefKind, Box<crate::parse::Constant>),
+    MethodType(String),
     Integer(i32),
+    Long(i64),
     Placeholder,
 }
 
 impl Constant {
-    fn as_class(&self) -> Option<&ClassInfo> {
+    pub fn as_class(&self) -> Option<&ClassInfo> {
         if let Self::Class(v) = self {
             Some(v)
         } else {
@@ -69,6 +106,13 @@ impl Constant {
     }
     pub fn as_method_ref(&self) -> Option<(ClassInfo, Box<Constant>)> {
         if let Self::MethodRef(value1, value2) = self {
+            Some((value1.to_owned(), value2.to_owned()))
+        } else {
+            None
+        }
+    }
+    pub fn as_field_ref(&self) -> Option<(ClassInfo, Box<Constant>)> {
+        if let Self::FieldRef(value1, value2) = self {
             Some((value1.to_owned(), value2.to_owned()))
         } else {
             None
@@ -196,6 +240,40 @@ fn parse_or_get_constant(
         CPInfo::ConstantIntegerInfo { tag, bytes } => {
             Constant::Integer(Cursor::new(bytes.to_be_bytes()).read_i32::<BigEndian>()?)
         }
+        CPInfo::ConstantLongInfo {
+            tag,
+            high_bytes,
+            low_bytes,
+        } => Constant::Long(
+            Cursor::new((((*high_bytes as u64) << 32) + *low_bytes as u64).to_be_bytes())
+                .read_i64::<BigEndian>()?,
+        ),
+        CPInfo::ConstantInterfaceMethodRefInfo {
+            tag,
+            class_index,
+            name_and_type_index,
+        } => {
+            let v = parse_or_get_constant(constant_pool, deserialized_constant_pool, *class_index)?;
+            let class = v.as_class().ok_or("is not a class")?;
+            let name_and_type = parse_or_get_constant(
+                constant_pool,
+                deserialized_constant_pool,
+                *name_and_type_index,
+            )?;
+            Constant::MethodRef(class.to_owned(), name_and_type.into())
+        }
+        CPInfo::ConstantMethodTypeInfo {
+            tag,
+            descriptor_index,
+        } => {
+            let descriptor_constant = parse_or_get_constant(
+                constant_pool,
+                deserialized_constant_pool,
+                *descriptor_index,
+            )?;
+            let descriptor = descriptor_constant.as_utf8().ok_or("no utf8")?;
+            Constant::MethodType(descriptor.to_owned())
+        }
     };
 
     constant_pool[(index - 1) as usize] = constant.to_owned();
@@ -236,7 +314,7 @@ fn parse_class_info(
 
 #[derive(Debug)]
 pub struct Field {
-    pub access: Access,
+    pub access: FieldAccess,
     pub name: String,
     pub descriptor: FieldDescriptor,
     pub attributes: Vec<Attribute>,
@@ -246,7 +324,7 @@ fn parse_field(
     field_info: &FieldInfo,
     constant_pool: &Vec<CPInfo>,
 ) -> Result<Field, Box<dyn Error>> {
-    let access = parse_access_flags(field_info.access_flags);
+    let access = FieldAccess::new(field_info.access_flags);
     let name_info = constant_pool
         .get((field_info.name_index - 1) as usize)
         .ok_or("failed to get name")?;
@@ -284,15 +362,21 @@ pub fn parse_field_descriptor(field_descriptor: String) -> Result<FieldDescripto
     })
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum FieldType {
     Integer,
+    Boolean,
+    Byte,
+    Char,
     LongInteger,
+    Float,
+    Double,
     ClassInstance(String),
     Array(Box<FieldType>),
 }
 
 fn parse_field_type(chars: &mut Chars) -> Result<FieldType, Box<dyn Error>> {
+    println!("chars: {chars:?}");
     match chars
         .nth(0)
         .ok_or("failed to get first char of field_type")?
@@ -303,6 +387,11 @@ fn parse_field_type(chars: &mut Chars) -> Result<FieldType, Box<dyn Error>> {
         '[' => Ok(FieldType::Array(Box::new(parse_field_type(chars)?))),
         'I' => Ok(FieldType::Integer),
         'J' => Ok(FieldType::LongInteger),
+        'Z' => Ok(FieldType::Boolean),
+        'B' => Ok(FieldType::Byte),
+        'C' => Ok(FieldType::Char),
+        'D' => Ok(FieldType::Double),
+        'F' => Ok(FieldType::Float),
         _ => unreachable!(),
     }
 }
@@ -351,13 +440,13 @@ fn parse_attribute(
     Ok(Attribute::Placeholder)
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct MethodDescriptor {
     pub parameter_descriptors: Vec<FieldType>,
     pub return_descriptor: ReturnDescriptor,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum ReturnDescriptor {
     FieldType(FieldType),
     VoidDescriptor,
@@ -391,7 +480,7 @@ pub fn parse_method_descriptor(
 
 #[derive(Debug)]
 pub struct Method {
-    pub access: Access,
+    pub access: ClassAccess,
     pub name: String,
     pub descriptor: MethodDescriptor,
     pub attributes: Vec<Attribute>,
@@ -432,7 +521,7 @@ fn parse_method(
 
 #[derive(Debug)]
 pub struct Class {
-    pub access: Access,
+    pub access: ClassAccess,
     pub constant_pool: Vec<Constant>,
     pub this_class: ClassInfo,
     pub super_class: Option<ClassInfo>,

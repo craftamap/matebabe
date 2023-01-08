@@ -26,12 +26,18 @@ pub struct DeserializedClassFile {
     pub attributes: Vec<AttributeInfo>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum CPInfo {
     // https://docs.oracle.com/javase/specs/jvms/se11/html/jvms-4.html#jvms-4.4.1
     ConstantClassInfo {
         tag: u8,
         name_index: u16,
+    },
+    // https://docs.oracle.com/javase/specs/jvms/se11/html/jvms-4.html#jvms-4.4.2
+    ConstantFieldRefInfo {
+        tag: u8,
+        class_index: u16,
+        name_and_type_index: u16,
     },
     // https://docs.oracle.com/javase/specs/jvms/se11/html/jvms-4.html#jvms-4.4.2
     ConstantMethodRefInfo {
@@ -40,7 +46,7 @@ pub enum CPInfo {
         name_and_type_index: u16,
     },
     // https://docs.oracle.com/javase/specs/jvms/se11/html/jvms-4.html#jvms-4.4.2
-    ConstantFieldRefInfo {
+    ConstantInterfaceMethodRefInfo {
         tag: u8,
         class_index: u16,
         name_and_type_index: u16,
@@ -54,6 +60,12 @@ pub enum CPInfo {
     ConstantIntegerInfo {
         tag: u8,
         bytes: u32,
+    },
+    // https://docs.oracle.com/javase/specs/jvms/se11/html/jvms-4.html#jvms-4.4.5
+    ConstantLongInfo {
+        tag: u8,
+        high_bytes: u32,
+        low_bytes: u32,
     },
     // https://docs.oracle.com/javase/specs/jvms/se11/html/jvms-4.html#jvms-4.4.6
     ConstantNameAndTypeInfo {
@@ -72,6 +84,10 @@ pub enum CPInfo {
         tag: u8,
         reference_kind: u8,
         reference_index: u16,
+    },
+    ConstantMethodTypeInfo {
+        tag: u8,
+        descriptor_index: u16,
     },
     // https://docs.oracle.com/javase/specs/jvms/se11/html/jvms-4.html#jvms-4.4.10
     ConstantInvokeDynamicInfo {
@@ -130,6 +146,16 @@ fn deserialize_constant_pool(rdr: &mut Cursor<Vec<u8>>) -> Result<CPInfo, Box<dy
             let bytes = rdr.read_u32::<BigEndian>()?;
             Ok(CPInfo::ConstantIntegerInfo { tag, bytes })
         }
+        5 => {
+            let high_bytes = rdr.read_u32::<BigEndian>()?;
+            let low_bytes = rdr.read_u32::<BigEndian>()?;
+
+            Ok(CPInfo::ConstantLongInfo {
+                tag,
+                high_bytes,
+                low_bytes,
+            })
+        }
         // CONSTANT_Class
         7 => {
             let name_index = rdr.read_u16::<BigEndian>()?;
@@ -164,6 +190,17 @@ fn deserialize_constant_pool(rdr: &mut Cursor<Vec<u8>>) -> Result<CPInfo, Box<dy
                 name_and_type_index,
             })
         }
+        // CONSTANT_InterfaceMethodref
+        11 => {
+            let class_index = rdr.read_u16::<BigEndian>()?;
+            let name_and_type_index = rdr.read_u16::<BigEndian>()?;
+
+            Ok(CPInfo::ConstantInterfaceMethodRefInfo {
+                tag,
+                class_index,
+                name_and_type_index,
+            })
+        }
         // CONSTANT_NameAndType
         12 => {
             let name_index = rdr.read_u16::<BigEndian>()?;
@@ -182,6 +219,13 @@ fn deserialize_constant_pool(rdr: &mut Cursor<Vec<u8>>) -> Result<CPInfo, Box<dy
                 tag,
                 reference_kind,
                 reference_index,
+            })
+        }
+        16 => {
+            let descriptor_index = rdr.read_u16::<BigEndian>()?;
+            Ok(CPInfo::ConstantMethodTypeInfo {
+                tag,
+                descriptor_index,
             })
         }
         18 => {
@@ -244,8 +288,20 @@ pub fn deserialize_class_file(path: String) -> Result<DeserializedClassFile, Box
     let constant_pool_count = rdr.read_u16::<BigEndian>()?;
     println!("constant_pool_count: {constant_pool_count}");
     let mut constant_pool: Vec<CPInfo> = Vec::new();
-    for _ in 0..constant_pool_count - 1 {
+    let mut it = 0..constant_pool_count - 1;
+    while let Some(i) = it.next() {
+        println!("index {}", i + 1);
         let cp_info = deserialize_constant_pool(&mut rdr)?;
+        match cp_info {
+            CPInfo::ConstantLongInfo { .. } => {
+                // for some ultra silly reason, longs and doubles take up two constant pool spaces.
+                // this is super annoying. we therefore insert the cp_info two times, and skip the
+                // next item.
+                constant_pool.push(cp_info.clone());
+                it.next();
+            }
+            _ => {}
+        }
         println!("{cp_info:?}");
         constant_pool.push(cp_info);
     }
