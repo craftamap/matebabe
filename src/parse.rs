@@ -31,7 +31,7 @@ fn parse_access_flags(access_flags: u16) -> ClassAccess {
     };
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct FieldAccess {
     pub public: bool,
     pub private: bool,
@@ -66,6 +66,54 @@ impl FieldAccess {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct MethodAccess {
+    pub public: bool,
+    pub private: bool,
+    pub protected: bool,
+    pub r#static: bool,
+    pub r#final: bool,
+    pub synchronized: bool,
+    pub bridge: bool,
+    pub varargs: bool,
+    pub native: bool,
+    pub r#abstract: bool,
+    pub strict: bool,
+    pub synthetic: bool,
+}
+
+impl MethodAccess {
+    fn new(access_flags: u16) -> MethodAccess {
+        let public = access_flags & 0x0001 == 0x0001;
+        let private = access_flags & 0x0002 == 0x0002;
+        let protected = access_flags & 0x0004 == 0x0004;
+        let r#static = access_flags & 0x0008 == 0x0008;
+        let r#final = access_flags & 0x0010 == 0x0010;
+        let r#synchronized = access_flags & 0x0020 == 0x0020;
+        let bridge = access_flags & 0x0040 == 0x0040;
+        let varargs = access_flags & 0x0080 == 0x0080;
+        let native = access_flags & 0x0100 == 0x0100;
+        let r#abstract = access_flags & 0x0400 == 0x0400;
+        let strict = access_flags & 0x0800 == 0x0800;
+        let synthetic = access_flags & 0x1000 == 0x1000;
+
+        return MethodAccess {
+            public,
+            private,
+            protected,
+            r#static,
+            r#final,
+            synchronized,
+            bridge,
+            varargs,
+            native,
+            r#abstract,
+            strict,
+            synthetic,
+        };
+    }
+}
+
 // https://docs.oracle.com/javase/specs/jvms/se11/html/jvms-5.html#jvms-5.4.3.5-220
 #[derive(Clone, Debug)]
 pub enum RefKind {
@@ -85,6 +133,8 @@ pub enum Constant {
     MethodType(String),
     Integer(i32),
     Long(i64),
+    Float(f32),
+    Double(f64),
     Placeholder,
 }
 
@@ -274,6 +324,17 @@ fn parse_or_get_constant(
             let descriptor = descriptor_constant.as_utf8().ok_or("no utf8")?;
             Constant::MethodType(descriptor.to_owned())
         }
+        CPInfo::ConstantFloatInfo { tag, bytes } => {
+            Constant::Float(Cursor::new(bytes.to_be_bytes()).read_f32::<BigEndian>()?)
+        }
+        CPInfo::ConstantDoubleInfo {
+            tag,
+            high_bytes,
+            low_bytes,
+        } => Constant::Double(
+            Cursor::new((((*high_bytes as u64) << 32) + *low_bytes as u64).to_be_bytes())
+                .read_f64::<BigEndian>()?,
+        ),
     };
 
     constant_pool[(index - 1) as usize] = constant.to_owned();
@@ -312,7 +373,7 @@ fn parse_class_info(
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Field {
     pub access: FieldAccess,
     pub name: String,
@@ -334,7 +395,7 @@ fn parse_field(
         .get((field_info.descriptor_index - 1) as usize)
         .expect("descriptor to be present");
     let descriptor_text = parse_utf8_info(descriptor_info);
-    let descriptor = parse_field_descriptor(descriptor_text)?;
+    let descriptor = parse_field_descriptor(&descriptor_text)?;
 
     println!("descriptor: {descriptor:?}");
 
@@ -356,7 +417,9 @@ pub struct FieldDescriptor {
     pub field_type: FieldType,
 }
 
-pub fn parse_field_descriptor(field_descriptor: String) -> Result<FieldDescriptor, Box<dyn Error>> {
+pub fn parse_field_descriptor(
+    field_descriptor: &String,
+) -> Result<FieldDescriptor, Box<dyn Error>> {
     Ok(FieldDescriptor {
         field_type: parse_field_type(&mut field_descriptor.chars())?,
     })
@@ -371,8 +434,19 @@ pub enum FieldType {
     LongInteger,
     Float,
     Double,
+    Short,
     ClassInstance(String),
     Array(Box<FieldType>),
+}
+
+impl FieldType {
+    pub fn as_class_instance(&self) -> Option<&String> {
+        if let Self::ClassInstance(v) = self {
+            Some(v)
+        } else {
+            None
+        }
+    }
 }
 
 fn parse_field_type(chars: &mut Chars) -> Result<FieldType, Box<dyn Error>> {
@@ -390,13 +464,14 @@ fn parse_field_type(chars: &mut Chars) -> Result<FieldType, Box<dyn Error>> {
         'Z' => Ok(FieldType::Boolean),
         'B' => Ok(FieldType::Byte),
         'C' => Ok(FieldType::Char),
+        'S' => Ok(FieldType::Short),
         'D' => Ok(FieldType::Double),
         'F' => Ok(FieldType::Float),
-        _ => unreachable!(),
+        char @ _ => unreachable!("encountered {char}"),
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum Attribute {
     Code { bytes: Vec<u8> },
     Placeholder,
@@ -478,9 +553,9 @@ pub fn parse_method_descriptor(
     })
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Method {
-    pub access: ClassAccess,
+    pub access: MethodAccess,
     pub name: String,
     pub descriptor: MethodDescriptor,
     pub attributes: Vec<Attribute>,
@@ -490,8 +565,7 @@ fn parse_method(
     field_info: &MethodInfo,
     constant_pool: &Vec<CPInfo>,
 ) -> Result<Method, Box<dyn Error>> {
-    // FIXME: methods have their own set of access_flags?
-    let access = parse_access_flags(field_info.access_flags);
+    let access = MethodAccess::new(field_info.access_flags);
     let name_info = constant_pool
         .get((field_info.name_index - 1) as usize)
         .ok_or("failed to get name")?;

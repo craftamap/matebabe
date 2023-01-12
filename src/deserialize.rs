@@ -61,8 +61,17 @@ pub enum CPInfo {
         tag: u8,
         bytes: u32,
     },
+    ConstantFloatInfo {
+        tag: u8,
+        bytes: u32,
+    },
     // https://docs.oracle.com/javase/specs/jvms/se11/html/jvms-4.html#jvms-4.4.5
     ConstantLongInfo {
+        tag: u8,
+        high_bytes: u32,
+        low_bytes: u32,
+    },
+    ConstantDoubleInfo {
         tag: u8,
         high_bytes: u32,
         low_bytes: u32,
@@ -124,7 +133,7 @@ pub struct MethodInfo {
 
 fn deserialize_constant_pool(rdr: &mut Cursor<Vec<u8>>) -> Result<CPInfo, Box<dyn Error>> {
     let tag = rdr.read_u8()?;
-    println!("tag: {tag}");
+    // println!("tag: {tag}");
 
     match tag {
         // CONSTANT_Utf8
@@ -146,7 +155,24 @@ fn deserialize_constant_pool(rdr: &mut Cursor<Vec<u8>>) -> Result<CPInfo, Box<dy
             let bytes = rdr.read_u32::<BigEndian>()?;
             Ok(CPInfo::ConstantIntegerInfo { tag, bytes })
         }
+        // CONSTANT_Float
+        4 => {
+            let bytes = rdr.read_u32::<BigEndian>()?;
+            Ok(CPInfo::ConstantFloatInfo { tag, bytes })
+        }
+        // CONSTANT_Long
         5 => {
+            let high_bytes = rdr.read_u32::<BigEndian>()?;
+            let low_bytes = rdr.read_u32::<BigEndian>()?;
+
+            Ok(CPInfo::ConstantLongInfo {
+                tag,
+                high_bytes,
+                low_bytes,
+            })
+        }
+        // CONSTANT_Long
+        6 => {
             let high_bytes = rdr.read_u32::<BigEndian>()?;
             let low_bytes = rdr.read_u32::<BigEndian>()?;
 
@@ -237,7 +263,7 @@ fn deserialize_constant_pool(rdr: &mut Cursor<Vec<u8>>) -> Result<CPInfo, Box<dy
                 name_and_type_index,
             })
         }
-        _ => todo!(),
+        tag @ _ => todo!("tag {tag} missing"),
     }
 }
 
@@ -283,14 +309,14 @@ pub fn deserialize_class_file(path: String) -> Result<DeserializedClassFile, Box
         return Err("unsupported major_version {major_version}".into());
     }
 
-    println!("{magic:#0x} {minor_version} {major_version}");
+    // println!("{magic:#0x} {minor_version} {major_version}");
 
     let constant_pool_count = rdr.read_u16::<BigEndian>()?;
-    println!("constant_pool_count: {constant_pool_count}");
+    // println!("constant_pool_count: {constant_pool_count}");
     let mut constant_pool: Vec<CPInfo> = Vec::new();
     let mut it = 0..constant_pool_count - 1;
     while let Some(i) = it.next() {
-        println!("index {}", i + 1);
+        // println!("index {}", i + 1);
         let cp_info = deserialize_constant_pool(&mut rdr)?;
         match cp_info {
             CPInfo::ConstantLongInfo { .. } => {
@@ -302,7 +328,7 @@ pub fn deserialize_class_file(path: String) -> Result<DeserializedClassFile, Box
             }
             _ => {}
         }
-        println!("{cp_info:?}");
+        // println!("{cp_info:?}");
         constant_pool.push(cp_info);
     }
 
@@ -374,7 +400,7 @@ pub fn deserialize_class_file(path: String) -> Result<DeserializedClassFile, Box
         attributes_count,
         attributes,
     };
-    println!("deserialize_class_file: {deserialized_class_file:?}");
+    // println!("deserialize_class_file: {deserialized_class_file:?}");
 
     return Ok(deserialized_class_file);
 }
