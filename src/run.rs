@@ -1,13 +1,15 @@
 use std::{
+    arch::global_asm,
     borrow::{Borrow, BorrowMut},
     cell::RefCell,
     collections::HashMap,
     error::Error,
+    fmt::Debug,
     io::Cursor,
     ops::Deref,
     path::Path,
     rc::{Rc, Weak},
-    vec,
+    vec, time::SystemTime,
 };
 
 use byteorder::{BigEndian, ReadBytesExt};
@@ -16,7 +18,7 @@ use crate::{
     deserialize::deserialize_class_file,
     parse::{
         parse, parse_field_descriptor, parse_method_descriptor, Attribute, Class as ParsedClass,
-        ClassInfo, Constant, Field, FieldType, Method, MethodDescriptor,
+        ClassInfo, Constant, ExceptionTableItem, Field, FieldType, Method, MethodDescriptor,
     },
 };
 
@@ -31,9 +33,11 @@ struct Frame {
     operand_stack: Vec<u32>,
     constant_pool: Weak<RuntimeConstantPool>,
     code_bytes: Option<Vec<u8>>,
+    exception_table: Option<Vec<ExceptionTableItem>>,
     instruction_counter: usize,
     class_name: String,
     method: Method,
+    running_native: bool,
 }
 
 impl Frame {
@@ -57,6 +61,8 @@ impl Frame {
             );
             let parsed_class = current_class
                 .unwrap()
+                .as_instance_klass()
+                .unwrap()
                 .parsed_class
                 .as_ref()
                 .ok_or("no parsed_class")?;
@@ -79,22 +85,27 @@ impl Frame {
 
         let current_method = current_method.unwrap();
         let mut code_bytes = None;
+        let mut exception_table = None;
         if !current_method.access.native {
+            // println!("current_class: {current_class:?}, current_method: {current_method:?}");
             let code = current_method
                 .attributes
                 .iter()
                 .filter(|attr| matches!(attr, Attribute::Code { .. }))
                 .next()
-                .ok_or("no code :(")?;
+                .ok_or("no code 1 :(")?;
             println!("current_method: {current_method:?}");
-
-            code_bytes = Some(code.as_code().ok_or("no code :(")?.to_owned());
+            let code = code.as_code().ok_or("no code 2 :(")?.to_owned();
+            exception_table = Some(code.3);
+            code_bytes = Some(code.0);
         }
 
         let current_frame = Frame {
             constant_pool: Rc::downgrade(
                 &current_class
                     .unwrap()
+                    .as_instance_klass()
+                    .ok_or("not an InstanceKlass")?
                     .constant_pool
                     .to_owned()
                     .ok_or("couldnt find stuff")?,
@@ -102,9 +113,11 @@ impl Frame {
             local_variables: vec![0; 20],
             operand_stack: vec![],
             code_bytes,
+            exception_table,
             instruction_counter: 0,
             class_name: class_name.to_owned(),
             method: current_method.to_owned(),
+            running_native: false,
         };
         println!(
             "new frame for method {}.{}({:?}): {:?}",
@@ -121,6 +134,24 @@ struct GlobalMemory {
 }
 
 impl GlobalMemory {
+    // loads, links and inits a class if required
+    fn ensure_class(&mut self, name: &str) -> Result<(), Box<dyn Error>> {
+        let maybe_class = self.method_area.classes.get(name.into());
+        if maybe_class.is_some() {
+            if maybe_class.unwrap().is_initialized() {
+                return Ok(());
+            }
+            // loaded, but maybe not linked and/or initialized
+            self.link_class(name.into())?;
+            self.load_class(name.into())?;
+        }
+
+        self.load_class(name.into())?;
+        self.link_class(name.into())?;
+        self.init_class(name.into())?;
+
+        Ok(())
+    }
     fn load_class(&mut self, name: String) -> Result<(), Box<dyn Error>> {
         if self.method_area.classes.contains_key(&name) {
             return Ok(());
@@ -131,6 +162,7 @@ impl GlobalMemory {
             "../../openjdk/jdk11u/build/linux-x86_64-normal-server-release/jdk/modules/java.base",
         ];
 
+        println!("load_class name: {}", name);
         let mut path = None;
         for directory in class_path.iter() {
             let potential_path = Path::new(directory).join(name.to_owned() + ".class");
@@ -150,8 +182,13 @@ impl GlobalMemory {
         let class = parse(deserialized)?;
 
         if let Some(ref class) = class.super_class {
-            println!("found super class {class:?}, loading it!");
+            // println!("found super class {class:?}, loading it!");
             self.load_class(class.name.to_owned())?;
+        }
+
+        for interface in class.interfaces.iter() {
+            // println!("found interface {class:?}, loading it!");
+            self.load_class(interface.name.to_owned())?;
         }
 
         // TODO: load interfaces
@@ -159,7 +196,7 @@ impl GlobalMemory {
         let rc_class = Rc::new(class);
         self.method_area.add_class(
             name.to_owned(),
-            Klass {
+            InstanceKlass {
                 name,
                 parsed_class: Some(rc_class.clone()),
                 fields: None,
@@ -179,7 +216,9 @@ impl GlobalMemory {
             .method_area
             .classes
             .get(&class_name)
-            .ok_or("class not found")?;
+            .ok_or("class not found")?
+            .as_instance_klass()
+            .ok_or("not an InstanceKlass")?;
 
         if klass.is_linked() {
             println!("Class {class_name} already linked, skip linking :^)");
@@ -205,7 +244,9 @@ impl GlobalMemory {
             .method_area
             .classes
             .get(&class_name)
-            .ok_or("class not found")?;
+            .ok_or("class not found")?
+            .as_instance_klass()
+            .ok_or("as InstanceKlass")?;
 
         // preperation
         let mut field_values: Vec<u32> = vec![];
@@ -259,7 +300,7 @@ impl GlobalMemory {
             .classes
             .get(&"java/lang/Class".to_owned())
             .ok_or("class not found in method area 1 :(")?;
-        let klass_java_clone = self.heap.allocate_class(klass);
+        let klass_java_clone = self.heap.allocate_klass(klass);
 
         let klass = self
             .method_area
@@ -267,6 +308,7 @@ impl GlobalMemory {
             .get_mut(&class.this_class.name.to_owned());
 
         if let Some(klass) = klass {
+            let klass = klass.as_mut_instance_klass().ok_or("not an instance")?;
             klass.constant_pool = Some(Rc::new(RuntimeConstantPool { pool }));
             klass
                 .static_field_values
@@ -288,7 +330,9 @@ impl GlobalMemory {
             .method_area
             .classes
             .get_mut(&class_name.to_owned())
-            .ok_or("class not found")?;
+            .ok_or("class not found")?
+            .as_mut_instance_klass()
+            .unwrap();
 
         if class.is_initialized() {
             println!("Class {class_name} already linked, skip init :^)");
@@ -317,12 +361,41 @@ impl GlobalMemory {
             )?;
             let mut init_thread = Thread {
                 thread_memory: ThreadMemory { jvm_stack: vec![] },
+                is_throwing: false,
             };
             init_thread.thread_memory.jvm_stack.push(current_frame);
             init_thread.run(self)?;
         }
 
         Ok(())
+    }
+
+    fn ensure_array(&mut self, array_type: String) -> Result<(), Box<dyn Error>> {
+        println!("ensure_array");
+        let arrayklass = self.method_area.classes.get(&array_type);
+        if arrayklass.is_some() {
+            println!("already initialized");
+            return Ok(());
+        }
+
+        // field layout of java/lang/Class
+        let klass = self
+            .method_area
+            .classes
+            .get(&"java/lang/Class".to_owned())
+            .ok_or("class not found in method area 1 :(")?;
+        let klass_java_clone = self.heap.allocate_klass(klass);
+
+        let arrayklass = ArrayKlass {
+            name: array_type.to_owned(),
+            java_clone: Some(klass_java_clone),
+        };
+
+        self.method_area
+            .classes
+            .insert(array_type, Box::new(arrayklass));
+
+        return Ok(());
     }
 }
 
@@ -346,15 +419,23 @@ impl Heap {
         return (self.data.len() - 1) as u32;
     }
 
-    fn allocate_class(&mut self, klass: &Klass) -> u32 {
+    fn allocate_klass(&mut self, klass: &Box<dyn Klass>) -> u32 {
         let mut field_values = vec![];
-        for field in klass.fields.to_owned().unwrap().iter() {
+        for field in klass
+            .as_instance_klass()
+            .ok_or("not an InstanceKlass")
+            .unwrap()
+            .fields
+            .to_owned()
+            .unwrap()
+            .iter()
+        {
             for _ in 0..field.field_width {
                 field_values.push(0);
             }
         }
 
-        return self.store(format!("L{};", klass.name), field_values);
+        return self.store(format!("L{};", klass.get_name()), field_values);
     }
 }
 
@@ -368,11 +449,11 @@ struct HeapItem {
 
 #[derive(Debug)]
 struct MethodArea {
-    classes: HashMap<String, Klass>,
+    classes: HashMap<String, Box<dyn Klass>>,
 }
 
 impl MethodArea {
-    fn add_class(&mut self, class_name: String, mut class: Klass) {
+    fn add_class(&mut self, class_name: String, mut class: InstanceKlass) {
         let parsed_class = &**class.parsed_class.as_ref().unwrap();
 
         let mut fields = vec![];
@@ -423,6 +504,8 @@ impl MethodArea {
                 .classes
                 .get(&class_info.name.to_owned())
                 .unwrap()
+                .as_instance_klass()
+                .unwrap()
                 .fields
                 .clone()
                 .unwrap();
@@ -433,7 +516,7 @@ impl MethodArea {
         class.fields = Some(fields);
         class.static_fields = Some(static_fields);
 
-        self.classes.insert(class_name, class);
+        self.classes.insert(class_name, Box::new(class));
     }
 }
 
@@ -446,8 +529,16 @@ struct KlassField {
     _parsed_field: Field,
 }
 
+trait Klass: Debug {
+    fn is_initialized(&self) -> bool;
+    fn get_name(&self) -> &str;
+    fn get_java_clone(&self) -> Option<u32>;
+    fn as_instance_klass(&self) -> Option<&InstanceKlass>;
+    fn as_mut_instance_klass(&mut self) -> Option<&mut InstanceKlass>;
+}
+
 #[derive(Debug)]
-struct Klass {
+struct InstanceKlass {
     name: String,
     parsed_class: Option<Rc<ParsedClass>>,
     constant_pool: Option<Rc<RuntimeConstantPool>>,
@@ -458,12 +549,30 @@ struct Klass {
     initialized: bool,
 }
 
-impl Klass {
-    fn is_linked(&self) -> bool {
-        self.constant_pool.is_some()
-    }
+impl Klass for InstanceKlass {
     fn is_initialized(&self) -> bool {
         self.initialized
+    }
+
+    fn get_name(&self) -> &str {
+        return self.name.as_str();
+    }
+
+    fn get_java_clone(&self) -> Option<u32> {
+        self.java_clone
+    }
+
+    fn as_instance_klass(&self) -> Option<&InstanceKlass> {
+        Some(self)
+    }
+    fn as_mut_instance_klass(&mut self) -> Option<&mut InstanceKlass> {
+        Some(self)
+    }
+}
+
+impl InstanceKlass {
+    fn is_linked(&self) -> bool {
+        self.constant_pool.is_some()
     }
 
     fn static_field_offset_with_strings(
@@ -549,6 +658,34 @@ impl Klass {
 }
 
 #[derive(Debug)]
+struct ArrayKlass {
+    name: String,
+    java_clone: Option<u32>,
+}
+
+impl Klass for ArrayKlass {
+    fn is_initialized(&self) -> bool {
+        true
+    }
+
+    fn get_name(&self) -> &str {
+        self.name.as_str()
+    }
+
+    fn get_java_clone(&self) -> Option<u32> {
+        self.java_clone
+    }
+
+    fn as_instance_klass(&self) -> Option<&InstanceKlass> {
+        None
+    }
+
+    fn as_mut_instance_klass(&mut self) -> Option<&mut InstanceKlass> {
+        None
+    }
+}
+
+#[derive(Debug)]
 struct RuntimeConstantPool {
     pool: Vec<Constant>,
 }
@@ -556,10 +693,11 @@ struct RuntimeConstantPool {
 #[derive(Debug)]
 struct Thread {
     thread_memory: ThreadMemory,
+    is_throwing: bool,
 }
 
 // FIXME: do proper binding!
-fn run_native_functions(
+fn run_native_methods(
     thread: &mut Thread,
     global_memory: &mut GlobalMemory,
 ) -> Result<(), Box<dyn Error>> {
@@ -568,6 +706,7 @@ fn run_native_functions(
         .jvm_stack
         .last_mut()
         .ok_or("no item on jvm stack")?;
+    current_frame.running_native = true;
 
     match current_frame.class_name.as_str() {
         "java/lang/Object" => match current_frame.method.name.as_str() {
@@ -593,8 +732,8 @@ fn run_native_functions(
                     .method_area
                     .classes
                     .get(&class_name.to_owned())
-                    .ok_or("no class")?
-                    .java_clone
+                    .ok_or("no class 1")?
+                    .get_java_clone()
                     .unwrap();
 
                 let invoker_frame_index = thread.thread_memory.jvm_stack.len() - 2;
@@ -643,18 +782,15 @@ fn run_native_functions(
                     .first()
                     .ok_or("no item in local_variables")?;
                 // FIXME: check if this_ref is null
-                let heap_item = global_memory
-                    .heap
-                    .data
-                    .get(this_ref.to_owned() as usize)
-                    .ok_or("this_ref not found on heap")?;
-                let descriptor = parse_field_descriptor(&heap_item.field_descriptor)?;
-                println!("descriptor: {descriptor:?}");
 
-                let class_name = descriptor
-                    .field_type
-                    .as_class_instance()
-                    .ok_or("not a class descriptor")?;
+                let klass = global_memory
+                    .method_area
+                    .classes
+                    .values()
+                    .find(|class| class.get_java_clone().unwrap() == *this_ref)
+                    .unwrap();
+
+                let class_name = klass.get_name();
 
                 let string_ref =
                     java_string_from_string(current_frame, global_memory, class_name.to_owned())?;
@@ -683,40 +819,15 @@ fn run_native_functions(
                     .local_variables
                     .first()
                     .ok_or("no item in local_variables")?;
-                let heap_item = global_memory
-                    .heap
-                    .data
-                    .get(primitive_type_ref.to_owned() as usize)
-                    .ok_or("this_ref not found on heap")?;
-                let bytes_offset = global_memory
-                    .method_area
-                    .classes
-                    .get("java/lang/String")
-                    .unwrap()
-                    .field_offset_with_strings("java/lang/String".to_owned(), "value".to_owned())?;
-                let bytes_ref = heap_item
-                    .data
-                    .get(bytes_offset)
-                    .ok_or("no data at bytes_offset")?;
 
-                let bytes_bytes = &global_memory
-                    .heap
-                    .data
-                    .get(*bytes_ref as usize)
-                    .as_ref()
-                    .ok_or("no bytes for string")?
-                    .data;
-
-                let text = String::from_utf8(bytes_bytes.iter().map(|b32| *b32 as u8).collect())?;
+                let text = string_from_java_string(global_memory, *primitive_type_ref)?;
 
                 println!("text: {:?}", text.bytes());
 
                 let java_clone_ref;
                 // NOTE: for some reason match didn't work here?
                 if text == "int" {
-                    global_memory.load_class("java/lang/Integer".to_owned())?;
-                    global_memory.link_class("java/lang/Integer".to_owned())?;
-                    global_memory.init_class("java/lang/Integer".to_owned())?;
+                    global_memory.ensure_class("java/lang/Integer".into())?;
 
                     java_clone_ref = Some(
                         global_memory
@@ -724,13 +835,11 @@ fn run_native_functions(
                             .classes
                             .get("java/lang/Integer")
                             .ok_or("class not found")?
-                            .java_clone
+                            .get_java_clone()
                             .ok_or("no java clone")?,
                     );
                 } else if text == "float" {
-                    global_memory.load_class("java/lang/Float".to_owned())?;
-                    global_memory.link_class("java/lang/Float".to_owned())?;
-                    global_memory.init_class("java/lang/Float".to_owned())?;
+                    global_memory.ensure_class("java/lang/Float".into())?;
 
                     java_clone_ref = Some(
                         global_memory
@@ -738,13 +847,11 @@ fn run_native_functions(
                             .classes
                             .get("java/lang/Float")
                             .ok_or("class not found")?
-                            .java_clone
+                            .get_java_clone()
                             .ok_or("no java clone")?,
                     );
                 } else if text == "double" {
-                    global_memory.load_class("java/lang/Double".to_owned())?;
-                    global_memory.link_class("java/lang/Double".to_owned())?;
-                    global_memory.init_class("java/lang/Double".to_owned())?;
+                    global_memory.ensure_class("java/lang/Double".into())?;
 
                     java_clone_ref = Some(
                         global_memory
@@ -752,7 +859,19 @@ fn run_native_functions(
                             .classes
                             .get("java/lang/Double")
                             .ok_or("class not found")?
-                            .java_clone
+                            .get_java_clone()
+                            .ok_or("no java clone")?,
+                    );
+                } else if text == "boolean" {
+                    global_memory.ensure_class("java/lang/Boolean".into())?;
+
+                    java_clone_ref = Some(
+                        global_memory
+                            .method_area
+                            .classes
+                            .get("java/lang/Boolean")
+                            .ok_or("class not found")?
+                            .get_java_clone()
                             .ok_or("no java clone")?,
                     );
                 } else {
@@ -822,6 +941,8 @@ fn run_native_functions(
                         .get("java/lang/String")
                         .as_ref()
                         .unwrap()
+                        .as_instance_klass()
+                        .unwrap()
                         .static_field_values
                         .as_ref()
                         .unwrap()
@@ -844,6 +965,60 @@ fn run_native_functions(
                     target_array.data[(dest_pos + i) as usize] =
                         src_array_data[(src_pos + i) as usize];
                 }
+            }
+            "identityHashCode" => {
+                let this_ref = current_frame
+                    .local_variables
+                    .first()
+                    .ok_or("no item in local_variables")?
+                    .to_owned();
+                let invoker_frame_index = thread.thread_memory.jvm_stack.len() - 2;
+                let frame = thread
+                    .thread_memory
+                    .jvm_stack
+                    .get_mut(invoker_frame_index)
+                    .ok_or("no invoker")?;
+
+                if this_ref == 0 {
+                    frame.operand_stack.push(0);
+                } else {
+                    // FIXME: proper hash
+                    frame.operand_stack.push(this_ref);
+                }
+            }
+            "initProperties" => {
+                let properties_ref = current_frame
+                    .local_variables
+                    .first()
+                    .ok_or("no item in local_variables")?
+                    .to_owned();
+
+                //  FIXME: initialize properties
+
+                let invoker_frame_index = thread.thread_memory.jvm_stack.len() - 2;
+                let invoker_frame = thread
+                    .thread_memory
+                    .jvm_stack
+                    .get_mut(invoker_frame_index)
+                    .ok_or("no invoker")?;
+
+                invoker_frame.operand_stack.push(properties_ref);
+            }
+            "nanoTime" => {
+                let duration_since_epoch = SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap();
+                let timestamp_nanos = duration_since_epoch.as_nanos() as u64;
+                let mut csr = Cursor::new(timestamp_nanos.to_be_bytes());
+                let invoker_frame_index = thread.thread_memory.jvm_stack.len() - 2;
+                let invoker_frame = thread
+                    .thread_memory
+                    .jvm_stack
+                    .get_mut(invoker_frame_index)
+                    .ok_or("no invoker")?;
+
+                invoker_frame.operand_stack.push(csr.read_u32::<BigEndian>()?);
+                invoker_frame.operand_stack.push(csr.read_u32::<BigEndian>()?);
             }
             method @ _ => {
                 unimplemented!("{method} has no native impl");
@@ -949,12 +1124,206 @@ fn run_native_functions(
                 unimplemented!("{method} has no native impl");
             }
         },
+        "java/lang/Throwable" => match current_frame.method.name.as_str() {
+            "fillInStackTrace" => {
+                // FIXME: dependant on other impls, not doing it for now
+                let this_ref = *current_frame
+                    .local_variables
+                    .get(0)
+                    .ok_or("no item in local_variables")?;
+
+                let invoker_frame_index = thread.thread_memory.jvm_stack.len() - 2;
+                let frame = thread
+                    .thread_memory
+                    .jvm_stack
+                    .get_mut(invoker_frame_index)
+                    .ok_or("no invoker")?;
+
+                frame.operand_stack.push(this_ref);
+            }
+            method @ _ => {
+                unimplemented!("{method} has no native impl");
+            }
+        },
+        "jdk/internal/misc/Unsafe" => match current_frame.method.name.as_str() {
+            "registerNatives" => {
+                // noop for now?
+            }
+            // NOTE: no idea what these values should actually be.
+            "arrayBaseOffset0" => {
+                let invoker_frame_index = thread.thread_memory.jvm_stack.len() - 2;
+                let frame = thread
+                    .thread_memory
+                    .jvm_stack
+                    .get_mut(invoker_frame_index)
+                    .ok_or("no invoker")?;
+
+                frame.operand_stack.push(0);
+            }
+            "arrayIndexScale0" => {
+                let invoker_frame_index = thread.thread_memory.jvm_stack.len() - 2;
+                let frame = thread
+                    .thread_memory
+                    .jvm_stack
+                    .get_mut(invoker_frame_index)
+                    .ok_or("no invoker")?;
+
+                frame.operand_stack.push(0);
+            }
+            "addressSize0" => {
+                let invoker_frame_index = thread.thread_memory.jvm_stack.len() - 2;
+                let frame = thread
+                    .thread_memory
+                    .jvm_stack
+                    .get_mut(invoker_frame_index)
+                    .ok_or("no invoker")?;
+
+                frame.operand_stack.push(0);
+            }
+            "isBigEndian0" => {
+                let invoker_frame_index = thread.thread_memory.jvm_stack.len() - 2;
+                let frame = thread
+                    .thread_memory
+                    .jvm_stack
+                    .get_mut(invoker_frame_index)
+                    .ok_or("no invoker")?;
+
+                frame.operand_stack.push(1);
+            }
+            "unalignedAccess0" => {
+                let invoker_frame_index = thread.thread_memory.jvm_stack.len() - 2;
+                let frame = thread
+                    .thread_memory
+                    .jvm_stack
+                    .get_mut(invoker_frame_index)
+                    .ok_or("no invoker")?;
+
+                frame.operand_stack.push(1);
+            }
+            "objectFieldOffset1" => {
+                let c = current_frame
+                    .local_variables
+                    .get(1)
+                    .ok_or("no item in local_variables")?;
+                let name_ref = current_frame
+                    .local_variables
+                    .get(2)
+                    .ok_or("no item in local_variables")?;
+
+                let field_name = string_from_java_string(global_memory, *name_ref)?;
+
+                let klass = global_memory
+                    .method_area
+                    .classes
+                    .values()
+                    .find(|class| {
+                        let clone = class.get_java_clone();
+                        clone.is_some() && clone.unwrap() == *c
+                    })
+                    .ok_or("class not found?")?;
+
+                let offset = klass
+                    .as_instance_klass()
+                    .unwrap()
+                    .field_offset_with_strings(
+                        klass.get_name().to_owned(),
+                        field_name.to_owned(),
+                    )?;
+
+                let invoker_frame_index = thread.thread_memory.jvm_stack.len() - 2;
+                let frame = thread
+                    .thread_memory
+                    .jvm_stack
+                    .get_mut(invoker_frame_index)
+                    .ok_or("no invoker")?;
+
+                // return value is a long  but I dont really care
+                frame.operand_stack.push(0);
+                frame.operand_stack.push(offset as u32);
+            }
+            "storeFence" => {
+                // noop
+            }
+            method @ _ => {
+                unimplemented!("{method} has no native impl");
+            }
+        },
+        "java/lang/Runtime" => match current_frame.method.name.as_str() {
+            "availableProcessors" => {
+                // For now, let's not report the actual number of processors.
+                let invoker_frame_index = thread.thread_memory.jvm_stack.len() - 2;
+                let frame = thread
+                    .thread_memory
+                    .jvm_stack
+                    .get_mut(invoker_frame_index)
+                    .ok_or("no invoker")?;
+
+                frame.operand_stack.push(1);
+            }
+            method @ _ => {
+                unimplemented!("{method} has no native impl");
+            }
+        },
+        "java/lang/Thread" => match current_frame.method.name.as_str() {
+            "registerNatives" => {
+                // noop for now?
+            }
+            method @ _ => {
+                unimplemented!("{method} has no native impl");
+            }
+        },
+        "jdk/internal/misc/VM" => match current_frame.method.name.as_str() {
+            "initialize" => {
+                // noop for now?
+            }
+            "initializeFromArchive" => {
+                // noop for now?
+            }
+            method @ _ => {
+                unimplemented!("{method} has no native impl");
+            }
+        },
         _ => {
             unimplemented!("{} {}", current_frame.class_name, current_frame.method.name)
         }
     }
 
     Ok(())
+}
+
+fn string_from_java_string(
+    global_memory: &GlobalMemory,
+    objectref: u32,
+) -> Result<String, Box<dyn Error>> {
+    let heap_item = global_memory
+        .heap
+        .data
+        .get(objectref.to_owned() as usize)
+        .ok_or("this_ref not found on heap")?;
+    let bytes_offset = global_memory
+        .method_area
+        .classes
+        .get("java/lang/String")
+        .unwrap()
+        .as_instance_klass()
+        .unwrap()
+        .field_offset_with_strings("java/lang/String".to_owned(), "value".to_owned())?;
+    let bytes_ref = heap_item
+        .data
+        .get(bytes_offset)
+        .ok_or("no data at bytes_offset")?;
+
+    let bytes_bytes = &global_memory
+        .heap
+        .data
+        .get(*bytes_ref as usize)
+        .as_ref()
+        .ok_or("no bytes for string")?
+        .data;
+
+    let text = String::from_utf8(bytes_bytes.iter().map(|b32| *b32 as u8).collect())?;
+
+    Ok(text)
 }
 
 fn java_string_from_string(
@@ -968,17 +1337,19 @@ fn java_string_from_string(
         .get("java/lang/String")
         .ok_or("class not found in method area 2 :(")?;
 
-    let string_objectref = global_memory.heap.allocate_class(klass);
+    let string_objectref = global_memory.heap.allocate_klass(klass);
 
     let bytes = string.bytes().map(|b| b as u32).collect::<Vec<u32>>();
 
     let array_objectref = global_memory.heap.store("[B".to_owned(), bytes);
 
-    let string_klass = *global_memory
+    let string_klass = global_memory
         .method_area
         .classes
         .get("java/lang/String")
         .as_ref()
+        .unwrap()
+        .as_instance_klass()
         .unwrap();
 
     let value_field_offset = string_klass
@@ -1005,6 +1376,70 @@ fn java_string_from_string(
 }
 
 impl Thread {
+    fn handle_exception(
+        &mut self,
+        global_memory: &mut GlobalMemory,
+        objectref: u32,
+    ) -> Result<(), Box<dyn Error>> {
+        let current_frame = self
+            .thread_memory
+            .jvm_stack
+            .last_mut()
+            .ok_or("no item on jvm stack")?;
+        let heap_item = global_memory
+            .heap
+            .data
+            .get(objectref as usize)
+            .ok_or("no ref")?;
+        let field_info_name = parse_field_descriptor(&heap_item.field_descriptor)?
+            .field_type
+            .as_class_instance()
+            .ok_or("not a class?")?
+            .to_owned();
+
+        let mut found_handler = false;
+        for item in current_frame.exception_table.as_ref().unwrap().iter() {
+            let class_info_name = current_frame
+                .constant_pool
+                .clone()
+                .upgrade()
+                .ok_or("no constant_pool")?
+                .pool
+                .get((item.catch_type - 1) as usize)
+                .ok_or("no constant")?
+                .as_class()
+                .ok_or("not a class_info")?
+                .name
+                .to_owned();
+            println!("item: {item:?} {class_info_name} {field_info_name}");
+            if item.start_pc <= current_frame.instruction_counter
+                && item.end_pc > current_frame.instruction_counter
+                && class_info_name == field_info_name
+            {
+                current_frame.instruction_counter = item.handler_pc;
+                found_handler = true;
+                println!("found handler!");
+                current_frame.operand_stack.push(objectref);
+                break;
+            }
+        }
+        if !found_handler {
+            if self.thread_memory.jvm_stack.len() == 1 {
+                // TODO: Handle this case differently
+                return Err("nowhere to go to :(".into());
+            }
+            self.is_throwing = true;
+            let invoker_frame_index = self.thread_memory.jvm_stack.len() - 2;
+            let frame = self
+                .thread_memory
+                .jvm_stack
+                .get_mut(invoker_frame_index)
+                .ok_or("no invoker")?;
+            frame.operand_stack.push(objectref);
+            self.thread_memory.jvm_stack.pop();
+        }
+        Ok(())
+    }
     fn run(&mut self, global_memory: &mut GlobalMemory) -> Result<(), Box<dyn Error>> {
         loop {
             let current_frame = self
@@ -1013,8 +1448,21 @@ impl Thread {
                 .last_mut()
                 .ok_or("no item on jvm stack")?;
 
+            if self.is_throwing {
+                let objectref = current_frame
+                    .operand_stack
+                    .pop()
+                    .ok_or("nothing to pop here")?;
+                self.handle_exception(global_memory, objectref)?;
+            }
+            let current_frame = self
+                .thread_memory
+                .jvm_stack
+                .last_mut()
+                .ok_or("no item on jvm stack")?;
+
             if current_frame.code_bytes.is_none() {
-                run_native_functions(self, global_memory)?;
+                run_native_methods(self, global_memory)?;
 
                 self.thread_memory.jvm_stack.pop();
 
@@ -1036,8 +1484,9 @@ impl Thread {
                 current_frame.operand_stack,
                 current_frame.local_variables
             );
+
             match instruction {
-                // iconst_i
+                // aconst_null
                 0x1 => {
                     current_frame.operand_stack.push(0);
                     current_frame.instruction_counter += 1;
@@ -1048,6 +1497,38 @@ impl Thread {
                     current_frame
                         .operand_stack
                         .push(Cursor::new(topush.to_be_bytes()).read_u32::<BigEndian>()?);
+                    current_frame.instruction_counter += 1;
+                }
+                // dconst_f
+                instruction @ (0x9 | 0xa) => {
+                    let topush = (*instruction - 0x9) as u64;
+                    let mut csr = Cursor::new(topush.to_be_bytes());
+                    current_frame
+                        .operand_stack
+                        .push(csr.read_u32::<BigEndian>()?);
+                    current_frame
+                        .operand_stack
+                        .push(csr.read_u32::<BigEndian>()?);
+                    current_frame.instruction_counter += 1;
+                }
+                // fconst_f
+                instruction @ (0xb | 0xc | 0xd) => {
+                    let topush = (*instruction - 0xb) as f32;
+                    current_frame
+                        .operand_stack
+                        .push(Cursor::new(topush.to_be_bytes()).read_u32::<BigEndian>()?);
+                    current_frame.instruction_counter += 1;
+                }
+                // dconst_f
+                instruction @ (0xe | 0xf) => {
+                    let topush = (*instruction - 0xe) as f64;
+                    let mut csr = Cursor::new(topush.to_be_bytes());
+                    current_frame
+                        .operand_stack
+                        .push(csr.read_u32::<BigEndian>()?);
+                    current_frame
+                        .operand_stack
+                        .push(csr.read_u32::<BigEndian>()?);
                     current_frame.instruction_counter += 1;
                 }
                 // bipush
@@ -1082,20 +1563,38 @@ impl Thread {
                         .push(Cursor::new((value as i32).to_be_bytes()).read_u32::<BigEndian>()?);
                     current_frame.instruction_counter += 1;
                 }
-                // ldc
-                0x12 => {
+                // ldc, ldc_w
+                instruction @ (0x12 | 0x13) => {
                     current_frame.instruction_counter += 1;
-                    let index = code_bytes
-                        .get(current_frame.instruction_counter)
-                        .ok_or("no bytes")?;
+                    let index: usize;
+                    if *instruction == 0x12 {
+                        // ldc
+                        index = *code_bytes
+                            .get(current_frame.instruction_counter)
+                            .ok_or("no bytes")? as usize;
+                    } else if *instruction == 0x13 {
+                        // ldc_w
+                        let indexbyte1 = (*code_bytes
+                            .get(current_frame.instruction_counter)
+                            .ok_or("no bytes")?) as u16;
+                        current_frame.instruction_counter += 1;
+                        let indexbyte2 = (*code_bytes
+                            .get(current_frame.instruction_counter)
+                            .ok_or("no bytes")?) as u16;
+
+                        index = ((indexbyte1 << 8) | indexbyte2) as usize;
+                    } else {
+                        unreachable!()
+                    }
+                    println!("index: {index}");
                     let loadable_constant = current_frame
                         .constant_pool
                         .clone()
                         .upgrade()
                         .ok_or("no constant_pool")?
                         .pool
-                        .get((index - 1) as usize)
-                        .ok_or("expected ur mom")?
+                        .get(index - 1)
+                        .ok_or("expected ur mom 1")?
                         .to_owned();
                     match loadable_constant {
                         Constant::String(string) => {
@@ -1110,12 +1609,33 @@ impl Thread {
                             current_frame.operand_stack.push(integer);
                         }
                         Constant::Class(class_info) => {
+                            println!("class_info {:?}", class_info);
+                            let name;
+                            if class_info.name.starts_with("[") {
+                                name = class_info.name.to_owned();
+
+                                let fd = parse_field_descriptor(&class_info.name.to_owned())?;
+                                let inner = fd.field_type.as_array().unwrap();
+                                // FIXME: find most-inner type
+                                if let Some(inner_classname) = inner.as_class_instance() {
+                                    println!("found inner_classname: {inner_classname:?}");
+                                    global_memory.ensure_class(&inner_classname.to_owned())?;
+                                } else {
+                                    println!("inner: {inner:?}");
+                                    // unreachable!("inner: {inner:?}");
+                                }
+                                global_memory.ensure_array(name.to_owned())?;
+                            } else {
+                                name = class_info.name;
+                                global_memory.ensure_class(&name.to_owned())?;
+                            }
+
                             let klass_java_clone = global_memory
                                 .method_area
                                 .classes
-                                .get(&class_info.name.to_owned())
-                                .ok_or("no class")?
-                                .java_clone
+                                .get(&name)
+                                .ok_or("no class 2")?
+                                .get_java_clone()
                                 .unwrap();
                             current_frame.operand_stack.push(klass_java_clone);
                         }
@@ -1149,7 +1669,7 @@ impl Thread {
                         .ok_or("no constant_pool")?
                         .pool
                         .get((index - 1) as usize)
-                        .ok_or("expected ur mom")?
+                        .ok_or("expected ur mom 2")?
                         .to_owned();
 
                     match loadable_constant {
@@ -1177,9 +1697,37 @@ impl Thread {
                     current_frame.operand_stack.push(integer);
                     current_frame.instruction_counter += 1;
                 }
+                // lload
+                0x16 => {
+                    current_frame.instruction_counter += 1;
+                    let index = code_bytes
+                        .get(current_frame.instruction_counter)
+                        .ok_or("no bytes")?;
+                    let value_part1 = current_frame.local_variables[*index as usize];
+                    let value_part2 = current_frame.local_variables[*index as usize];
+                    current_frame.operand_stack.push(value_part1);
+                    current_frame.operand_stack.push(value_part2);
+                    current_frame.instruction_counter += 1;
+                }
                 // iload_n
                 instruction @ (0x1a | 0x1b | 0x1c | 0x1d) => {
                     let integer = current_frame.local_variables[(instruction - 0x1a) as usize];
+                    current_frame.operand_stack.push(integer);
+
+                    current_frame.instruction_counter += 1;
+                }
+                // lload_n
+                instruction @ (0x1e | 0x1f | 0x20 | 0x21) => {
+                    let index = instruction - 0x1e;
+                    let value_part1 = current_frame.local_variables[index as usize];
+                    let value_part2 = current_frame.local_variables[index as usize];
+                    current_frame.operand_stack.push(value_part1);
+                    current_frame.operand_stack.push(value_part2);
+                    current_frame.instruction_counter += 1;
+                }
+                // fload_n
+                instruction @ (0x22 | 0x23 | 0x24 | 0x25) => {
+                    let integer = current_frame.local_variables[(instruction - 0x22) as usize];
                     current_frame.operand_stack.push(integer);
 
                     current_frame.instruction_counter += 1;
@@ -1188,6 +1736,35 @@ impl Thread {
                 instruction @ (0x2a | 0x2b | 0x2c | 0x2d) => {
                     let integer = current_frame.local_variables[(instruction - 0x2a) as usize];
                     current_frame.operand_stack.push(integer);
+
+                    current_frame.instruction_counter += 1;
+                }
+                // aaload
+                0x32 => {
+                    let index = Cursor::new(
+                        current_frame
+                            .operand_stack
+                            .pop()
+                            .ok_or("no item on the operand_stack 1")?
+                            .to_be_bytes(),
+                    )
+                    .read_i32::<BigEndian>()?;
+                    println!("index: {index}");
+                    let arrayref = current_frame
+                        .operand_stack
+                        .pop()
+                        .ok_or("no item on the operand_stack 2")?;
+
+                    let value = global_memory
+                        .heap
+                        .data
+                        .get_mut(arrayref as usize)
+                        .ok_or("arrayref not on heap")?
+                        .data
+                        .get(index as usize)
+                        .ok_or("arrays not that big")?;
+
+                    current_frame.operand_stack.push(*value);
 
                     current_frame.instruction_counter += 1;
                 }
@@ -1263,6 +1840,26 @@ impl Thread {
 
                     current_frame.instruction_counter += 1;
                 }
+                // lstore
+                0x37 => {
+                    current_frame.instruction_counter += 1;
+                    let index = code_bytes
+                        .get(current_frame.instruction_counter)
+                        .ok_or("no bytes")?;
+                    let value_part2 = current_frame
+                        .operand_stack
+                        .pop()
+                        .ok_or("no item on the operand_stack")?;
+                    let value_part1 = current_frame
+                        .operand_stack
+                        .pop()
+                        .ok_or("no item on the operand_stack")?;
+
+                    current_frame.local_variables[*index as usize] = value_part1;
+                    current_frame.local_variables[*index as usize + 1] = value_part2;
+
+                    current_frame.instruction_counter += 1;
+                }
                 // istore_n
                 instruction @ (0x3b | 0x3c | 0x3d | 0x3e) => {
                     let integer = current_frame
@@ -1270,6 +1867,23 @@ impl Thread {
                         .pop()
                         .ok_or("no item on the operand_stack")?;
                     current_frame.local_variables[(instruction - 0x3b) as usize] = integer;
+
+                    current_frame.instruction_counter += 1;
+                }
+                // lstore
+                instruction @ (0x3f | 0x40 | 0x41 | 0x42) => {
+                    let index = instruction - 0x3f;
+                    let value_part2 = current_frame
+                        .operand_stack
+                        .pop()
+                        .ok_or("no item on the operand_stack")?;
+                    let value_part1 = current_frame
+                        .operand_stack
+                        .pop()
+                        .ok_or("no item on the operand_stack")?;
+
+                    current_frame.local_variables[index as usize] = value_part1;
+                    current_frame.local_variables[index as usize + 1] = value_part2;
 
                     current_frame.instruction_counter += 1;
                 }
@@ -1283,8 +1897,8 @@ impl Thread {
 
                     current_frame.instruction_counter += 1;
                 }
-                // bastore, iastore
-                0x4f | 0x54 => {
+                // bastore, aastore, iastore
+                0x4f | 0x53 | 0x54 => {
                     // value does not need to be unwrapped, as it will be stored as a java integer
                     // anyway
                     let value = current_frame
@@ -1378,6 +1992,8 @@ impl Thread {
                     current_frame.operand_stack.push(value1);
                     current_frame.operand_stack.push(value2);
                     current_frame.operand_stack.push(value1);
+
+                    current_frame.instruction_counter += 1;
                 }
                 // iadd
                 0x60 => {
@@ -1423,6 +2039,43 @@ impl Thread {
                         .read_i64::<BigEndian>()?;
                     let value2 = Cursor::new(((value2_part1 << 16) | value2_part2).to_be_bytes())
                         .read_i64::<BigEndian>()?;
+
+                    let result = value1 + value2;
+                    let mut csr = Cursor::new(result.to_be_bytes());
+                    let result_part1 = csr.read_u32::<BigEndian>()?;
+                    let result_part2 = csr.read_u32::<BigEndian>()?;
+
+                    current_frame.operand_stack.push(result_part1);
+                    current_frame.operand_stack.push(result_part2);
+                    current_frame.instruction_counter += 1;
+                }
+                // dadd
+                0x63 => {
+                    let value2_part2 = current_frame
+                        .operand_stack
+                        .pop()
+                        .ok_or("no item on the operand_stack")?
+                        as u64;
+                    let value2_part1 = current_frame
+                        .operand_stack
+                        .pop()
+                        .ok_or("no item on the operand_stack")?
+                        as u64;
+                    let value1_part2 = current_frame
+                        .operand_stack
+                        .pop()
+                        .ok_or("no item on the operand_stack")?
+                        as u64;
+                    let value1_part1 = current_frame
+                        .operand_stack
+                        .pop()
+                        .ok_or("no item on the operand_stack")?
+                        as u64;
+
+                    let value1 = Cursor::new(((value1_part1 << 16) | value1_part2).to_be_bytes())
+                        .read_f64::<BigEndian>()?;
+                    let value2 = Cursor::new(((value2_part1 << 16) | value2_part2).to_be_bytes())
+                        .read_f64::<BigEndian>()?;
 
                     let result = value1 + value2;
                     let mut csr = Cursor::new(result.to_be_bytes());
@@ -1521,6 +2174,24 @@ impl Thread {
                     // TODO: check if rounding is equals?
                     let result = Cursor::new(value1.to_be_bytes()).read_i32::<BigEndian>()?
                         / Cursor::new(value2.to_be_bytes()).read_i32::<BigEndian>()?;
+                    println!("result is {result}");
+                    current_frame
+                        .operand_stack
+                        .push(Cursor::new(result.to_be_bytes()).read_u32::<BigEndian>()?);
+                    current_frame.instruction_counter += 1;
+                }
+                // fdiv
+                0x6e => {
+                    let value2 = current_frame
+                        .operand_stack
+                        .pop()
+                        .ok_or("no item on the operand_stack")?;
+                    let value1 = current_frame
+                        .operand_stack
+                        .pop()
+                        .ok_or("no item on the operand_stack")?;
+                    let result = Cursor::new(value1.to_be_bytes()).read_f32::<BigEndian>()?
+                        / Cursor::new(value2.to_be_bytes()).read_f32::<BigEndian>()?;
                     println!("result is {result}");
                     current_frame
                         .operand_stack
@@ -1656,6 +2327,37 @@ impl Thread {
                     current_frame.operand_stack.push(result);
                     current_frame.instruction_counter += 1;
                 }
+                // lushl
+                0x7d => {
+                    let value2 = current_frame
+                        .operand_stack
+                        .pop()
+                        .ok_or("no item on the operand_stack")?;
+                    let value1_part2 = current_frame
+                        .operand_stack
+                        .pop()
+                        .ok_or("no item on the operand_stack")?
+                        as u64;
+                    let value1_part1 = current_frame
+                        .operand_stack
+                        .pop()
+                        .ok_or("no item on the operand_stack")?
+                        as u64;
+
+                    let value1 = Cursor::new(((value1_part1 << 16) | value1_part2).to_be_bytes())
+                        .read_i64::<BigEndian>()?;
+                    let value2 = Cursor::new(value2.to_be_bytes()).read_i32::<BigEndian>()?;
+
+                    let result = value1.wrapping_shr(value2 as u32);
+
+                    let mut csr = Cursor::new(result.to_be_bytes());
+                    let result_part1 = csr.read_u32::<BigEndian>()?;
+                    let result_part2 = csr.read_u32::<BigEndian>()?;
+
+                    current_frame.operand_stack.push(result_part1);
+                    current_frame.operand_stack.push(result_part2);
+                    current_frame.instruction_counter += 1;
+                }
                 // iand
                 0x7e => {
                     let value2 = current_frame
@@ -1727,6 +2429,60 @@ impl Thread {
                         .push(Cursor::new(result.to_be_bytes()).read_u32::<BigEndian>()?);
                     current_frame.instruction_counter += 1;
                 }
+                // ixor
+                0x82 => {
+                    let value2 = current_frame
+                        .operand_stack
+                        .pop()
+                        .ok_or("no item on the operand_stack")?;
+                    let value1 = current_frame
+                        .operand_stack
+                        .pop()
+                        .ok_or("no item on the operand_stack")?;
+                    let result = Cursor::new(value1.to_be_bytes()).read_i32::<BigEndian>()?
+                        ^ Cursor::new(value2.to_be_bytes()).read_i32::<BigEndian>()?;
+                    current_frame
+                        .operand_stack
+                        .push(Cursor::new(result.to_be_bytes()).read_u32::<BigEndian>()?);
+                    current_frame.instruction_counter += 1;
+                }
+                // lxor
+                0x83 => {
+                    let value2_part2 = current_frame
+                        .operand_stack
+                        .pop()
+                        .ok_or("no item on the operand_stack")?
+                        as u64;
+                    let value2_part1 = current_frame
+                        .operand_stack
+                        .pop()
+                        .ok_or("no item on the operand_stack")?
+                        as u64;
+                    let value1_part2 = current_frame
+                        .operand_stack
+                        .pop()
+                        .ok_or("no item on the operand_stack")?
+                        as u64;
+                    let value1_part1 = current_frame
+                        .operand_stack
+                        .pop()
+                        .ok_or("no item on the operand_stack")?
+                        as u64;
+
+                    let value1 = Cursor::new(((value1_part1 << 16) | value1_part2).to_be_bytes())
+                        .read_i64::<BigEndian>()?;
+                    let value2 = Cursor::new(((value2_part1 << 16) | value2_part2).to_be_bytes())
+                        .read_i64::<BigEndian>()?;
+
+                    let result = value1 ^ value2;
+                    let mut csr = Cursor::new(result.to_be_bytes());
+                    let result_part1 = csr.read_u32::<BigEndian>()?;
+                    let result_part2 = csr.read_u32::<BigEndian>()?;
+
+                    current_frame.operand_stack.push(result_part1);
+                    current_frame.operand_stack.push(result_part2);
+                    current_frame.instruction_counter += 1;
+                }
                 // iinc
                 0x84 => {
                     current_frame.instruction_counter += 1;
@@ -1777,7 +2533,95 @@ impl Thread {
 
                     current_frame.instruction_counter += 1;
                 }
-                //i2b
+                // l2i
+                0x88 => {
+                    let value_part2 = current_frame
+                        .operand_stack
+                        .pop()
+                        .ok_or("no item on the operand_stack")?
+                        as u64;
+                    let value_part1 = current_frame
+                        .operand_stack
+                        .pop()
+                        .ok_or("no item on the operand_stack")?
+                        as u64;
+
+                    let long_bytes = (value_part1 << 32) + (value_part2);
+                    let value = Cursor::new(long_bytes.to_be_bytes()).read_i64::<BigEndian>()?;
+
+                    current_frame
+                        .operand_stack
+                        .push(Cursor::new((value as i32).to_be_bytes()).read_u32::<BigEndian>()?);
+                    current_frame.instruction_counter += 1;
+                }
+                // l2f
+                0x89 => {
+                    let value_part2 = current_frame
+                        .operand_stack
+                        .pop()
+                        .ok_or("no item on the operand_stack")?
+                        as u64;
+                    let value_part1 = current_frame
+                        .operand_stack
+                        .pop()
+                        .ok_or("no item on the operand_stack")?
+                        as u64;
+
+                    let long_bytes = (value_part1 << 32) + (value_part2);
+                    let value = Cursor::new(long_bytes.to_be_bytes()).read_i64::<BigEndian>()?;
+
+                    current_frame
+                        .operand_stack
+                        .push(Cursor::new((value as f32).to_be_bytes()).read_u32::<BigEndian>()?);
+                    current_frame.instruction_counter += 1;
+                }
+                // f2d
+                0x8d => {
+                    let value = Cursor::new(
+                        current_frame
+                            .operand_stack
+                            .pop()
+                            .ok_or("no item on the operand_stack")?
+                            .to_be_bytes(),
+                    )
+                    .read_f32::<BigEndian>()? as f64;
+                    let mut csr = Cursor::new(value.to_be_bytes());
+
+                    current_frame
+                        .operand_stack
+                        .push(csr.read_u32::<BigEndian>()?);
+                    current_frame
+                        .operand_stack
+                        .push(csr.read_u32::<BigEndian>()?);
+                    current_frame.instruction_counter += 1;
+                }
+                // d2l
+                0x8f => {
+                    let value_part2 = current_frame
+                        .operand_stack
+                        .pop()
+                        .ok_or("no item on the operand_stack")?
+                        as u64;
+                    let value_part1 = current_frame
+                        .operand_stack
+                        .pop()
+                        .ok_or("no item on the operand_stack")?
+                        as u64;
+
+                    let long_bytes = (value_part1 << 32) + (value_part2);
+                    let value = Cursor::new(long_bytes.to_be_bytes()).read_f64::<BigEndian>()?;
+
+                    let mut csr = Cursor::new((value as i64).to_be_bytes());
+
+                    current_frame
+                        .operand_stack
+                        .push(csr.read_u32::<BigEndian>()?);
+                    current_frame
+                        .operand_stack
+                        .push(csr.read_u32::<BigEndian>()?);
+                    current_frame.instruction_counter += 1;
+                }
+                // i2b
                 0x91 => {
                     let value = Cursor::new(
                         current_frame
@@ -1805,6 +2649,80 @@ impl Thread {
                     current_frame
                         .operand_stack
                         .push(Cursor::new(value.to_be_bytes()).read_u32::<BigEndian>()?);
+                    current_frame.instruction_counter += 1;
+                }
+                // lcmp
+                0x94 => {
+                    let value2_part2 = current_frame
+                        .operand_stack
+                        .pop()
+                        .ok_or("no item on the operand_stack")?
+                        as u64;
+                    let value2_part1 = current_frame
+                        .operand_stack
+                        .pop()
+                        .ok_or("no item on the operand_stack")?
+                        as u64;
+                    let value1_part2 = current_frame
+                        .operand_stack
+                        .pop()
+                        .ok_or("no item on the operand_stack")?
+                        as u64;
+                    let value1_part1 = current_frame
+                        .operand_stack
+                        .pop()
+                        .ok_or("no item on the operand_stack")?
+                        as u64;
+
+                    let value1 = Cursor::new(((value1_part1 << 16) | value1_part2).to_be_bytes())
+                        .read_i64::<BigEndian>()?;
+                    let value2 = Cursor::new(((value2_part1 << 16) | value2_part2).to_be_bytes())
+                        .read_i64::<BigEndian>()?;
+
+                    let result;
+                    if value1 > value2 {
+                        result = 1;
+                    } else if value1 == value2 {
+                        result = 0;
+                    } else if value1 < value2 {
+                        result = -1;
+                    } else {
+                        unreachable!();
+                    }
+                    current_frame.operand_stack.push(result as u32);
+                    current_frame.instruction_counter += 1;
+                }
+                // fcmp
+                0x95 => {
+                    let value2 = Cursor::new(
+                        current_frame
+                            .operand_stack
+                            .pop()
+                            .ok_or("no item on the operand_stack")?
+                            .to_be_bytes(),
+                    )
+                    .read_f32::<BigEndian>()?;
+                    let value1 = Cursor::new(
+                        current_frame
+                            .operand_stack
+                            .pop()
+                            .ok_or("no item on the operand_stack")?
+                            .to_be_bytes(),
+                    )
+                    .read_f32::<BigEndian>()?;
+
+                    let result;
+                    if value1 > value2 {
+                        result = 1;
+                    } else if value1 == value2 {
+                        result = 0;
+                    } else if value1 < value2 {
+                        result = -1;
+                    } else {
+                        // TODO: different for fcmpg
+                        result = -1;
+                    }
+                    current_frame.operand_stack.push(result as u32);
                     current_frame.instruction_counter += 1;
                 }
                 // ifeq
@@ -1905,6 +2823,44 @@ impl Thread {
                         current_frame.instruction_counter += 1;
                     }
                 }
+                // if_acmp<cond>
+                instruction @ (0xa5 | 0xa6) => {
+                    current_frame.instruction_counter += 1;
+                    let branchbyte1 = (*code_bytes
+                        .get(current_frame.instruction_counter)
+                        .ok_or("no bytes")?) as u16;
+                    current_frame.instruction_counter += 1;
+                    let branchbyte2 = (*code_bytes
+                        .get(current_frame.instruction_counter)
+                        .ok_or("no bytes")?) as u16;
+
+                    let branchoffset =
+                        Cursor::new(((branchbyte1 << 8) | branchbyte2).to_be_bytes())
+                            .read_i16::<BigEndian>()?;
+
+                    let value2 = current_frame
+                        .operand_stack
+                        .pop()
+                        .ok_or("no item on the operand_stack")?;
+                    let value1 = current_frame
+                        .operand_stack
+                        .pop()
+                        .ok_or("no item on the operand_stack")?;
+
+                    let mut result = false;
+                    if *instruction == 0xa5 {
+                        result = value1 == value2;
+                    } else if *instruction == 0xa6 {
+                        result = value1 != value2;
+                    }
+
+                    if result {
+                        current_frame.instruction_counter =
+                            current_frame.instruction_counter - 2 + branchoffset as usize;
+                    } else {
+                        current_frame.instruction_counter += 1;
+                    }
+                }
                 // goto
                 0xa7 => {
                     current_frame.instruction_counter += 1;
@@ -1923,6 +2879,28 @@ impl Thread {
                     current_frame.instruction_counter =
                         ((current_frame.instruction_counter - 2) as isize + branchoffset as isize)
                             as usize;
+                }
+                // lreturn
+                0xad => {
+                    let value2 = current_frame
+                        .operand_stack
+                        .pop()
+                        .ok_or("no return value on operand stack")?;
+                    let value1 = current_frame
+                        .operand_stack
+                        .pop()
+                        .ok_or("no return value on operand stack")?;
+
+                    let invoker_frame_index = self.thread_memory.jvm_stack.len() - 2;
+                    let frame = self
+                        .thread_memory
+                        .jvm_stack
+                        .get_mut(invoker_frame_index)
+                        .ok_or("no invoker")?;
+
+                    frame.operand_stack.push(value1);
+                    frame.operand_stack.push(value2);
+                    self.thread_memory.jvm_stack.pop();
                 }
                 // ireturn, areturn
                 0xac | 0xb0 => {
@@ -1989,7 +2967,7 @@ impl Thread {
                         .ok_or("no constant_pool")?
                         .pool
                         .get((index - 1) as usize)
-                        .ok_or("expected ur mom")?
+                        .ok_or("expected ur mom 3")?
                         .to_owned();
 
                     let (class_info, name_and_type) = field_ref_constant
@@ -2001,12 +2979,10 @@ impl Thread {
 
                     let type_descriptor = parse_field_descriptor(&field_descriptor_text)?;
 
-                    global_memory.load_class(class_info.name.to_owned())?;
-                    global_memory.link_class(class_info.name.to_owned())?;
-                    global_memory.init_class(class_info.name.to_owned())?;
+                    global_memory.ensure_class(class_info.name.as_str())?;
 
                     let class = global_memory.method_area.classes.get(&class_info.name);
-                    let class = class.as_ref().unwrap().deref();
+                    let class = class.as_ref().unwrap().deref().as_instance_klass().unwrap();
 
                     let static_field_offset = class.static_field_offset(field_ref_constant)?;
 
@@ -2046,7 +3022,7 @@ impl Thread {
                         .ok_or("no constant_pool")?
                         .pool
                         .get((index - 1) as usize)
-                        .ok_or("expected ur mom")?
+                        .ok_or("expected ur mom 4")?
                         .to_owned();
 
                     let (class_info, name_and_type) = field_ref_constant
@@ -2058,12 +3034,10 @@ impl Thread {
 
                     let type_descriptor = parse_field_descriptor(&field_descriptor_text)?;
 
-                    global_memory.load_class(class_info.name.to_owned())?;
-                    global_memory.link_class(class_info.name.to_owned())?;
-                    global_memory.init_class(class_info.name.to_owned())?;
+                    global_memory.ensure_class(class_info.name.as_str())?;
 
                     let mut class = global_memory.method_area.classes.get_mut(&class_info.name);
-                    let class = class.as_mut().unwrap();
+                    let class = class.as_mut().unwrap().as_mut_instance_klass().unwrap();
 
                     let static_field_offset = class.static_field_offset(field_ref_constant)?;
 
@@ -2093,8 +3067,10 @@ impl Thread {
                         .ok_or("no constant_pool")?
                         .pool
                         .get((index - 1) as usize)
-                        .ok_or("expected ur mom")?
+                        .ok_or("expected ur mom 5")?
                         .to_owned();
+
+                    println!("constant: {:?}", constant);
 
                     let objectref = current_frame
                         .operand_stack
@@ -2113,23 +3089,52 @@ impl Thread {
                         .field_type
                         .as_class_instance()
                         .ok_or("not a class instance")?;
-                    println!("class_name: {class_name}");
+                    println!("class_name: {class_name} field_descriptor: {field_descriptor:?}");
                     let offset = global_memory
                         .method_area
                         .classes
                         .get(&class_name.to_owned())
                         .ok_or(format!("didnt find class {class_name} in method_area"))?
-                        .field_offset(constant)?;
+                        .as_instance_klass()
+                        .unwrap()
+                        .field_offset(constant.to_owned())?;
 
-                    // fixme: handle longs?
-                    let value = global_memory
-                        .heap
-                        .data
-                        .get_mut(objectref as usize)
-                        .ok_or("item not on heap")?
-                        .data[offset];
+                    let field_ref = constant
+                        .to_owned()
+                        .as_field_ref()
+                        .ok_or("expected field_ref")?;
+                    let (_, r#type) = field_ref
+                        .1
+                        .as_name_and_type()
+                        .ok_or("expected name_and_type")?;
+                    let fd = parse_field_descriptor(&r#type)?;
 
-                    current_frame.operand_stack.push(value);
+                    if matches!(fd.field_type, FieldType::LongInteger | FieldType::Double) {
+                        let value_part1 = global_memory
+                            .heap
+                            .data
+                            .get_mut(objectref as usize)
+                            .ok_or("item not on heap")?
+                            .data[offset];
+                        let value_part2 = global_memory
+                            .heap
+                            .data
+                            .get_mut(objectref as usize + 1)
+                            .ok_or("item not on heap")?
+                            .data[offset];
+
+                        current_frame.operand_stack.push(value_part1);
+                        current_frame.operand_stack.push(value_part2);
+                    } else {
+                        let value = global_memory
+                            .heap
+                            .data
+                            .get_mut(objectref as usize)
+                            .ok_or("item not on heap")?
+                            .data[offset];
+
+                        current_frame.operand_stack.push(value);
+                    }
 
                     current_frame.instruction_counter += 1;
                 }
@@ -2153,7 +3158,7 @@ impl Thread {
                         .ok_or("no constant_pool")?
                         .pool
                         .get((index - 1) as usize)
-                        .ok_or("expected ur mom")?
+                        .ok_or("expected ur mom 6")?
                         .to_owned();
 
                     let value = current_frame
@@ -2182,6 +3187,8 @@ impl Thread {
                         .classes
                         .get(&class_name.to_owned())
                         .ok_or(format!("didnt find class {class_name} in method_area"))?
+                        .as_instance_klass()
+                        .unwrap()
                         .field_offset(constant)?;
 
                     // FIXME: handle longs
@@ -2223,8 +3230,7 @@ impl Thread {
                         .ok_or("not a NameAndType")?;
                     let type_descriptor = parse_method_descriptor(method_descriptor_text)?;
 
-                    global_memory.load_class(class_info.name.to_owned())?;
-                    global_memory.link_class(class_info.name.to_owned())?;
+                    global_memory.ensure_class(class_info.name.as_str())?;
 
                     println!("name {name} type_descriptor {type_descriptor:?}");
 
@@ -2242,8 +3248,22 @@ impl Thread {
                         .pop()
                         .ok_or("object_ref is not on the stack")?;
 
-                    let mut new_frame =
-                        Frame::new(global_memory, class_info.name, name, type_descriptor)?;
+                    let heap_item = global_memory
+                        .heap
+                        .data
+                        .get(object_ref.to_owned() as usize)
+                        .ok_or("this_ref not found on heap")?;
+                    let descriptor = parse_field_descriptor(&heap_item.field_descriptor)?;
+                    let mut new_frame = Frame::new(
+                        global_memory,
+                        descriptor
+                            .field_type
+                            .as_class_instance()
+                            .unwrap()
+                            .to_owned(),
+                        name,
+                        type_descriptor,
+                    )?;
                     // FIXME: this probably doesnt handle longs correctly?
                     new_frame.local_variables[0] = object_ref;
                     for narg in nargs.iter().enumerate() {
@@ -2282,9 +3302,7 @@ impl Thread {
                         .as_name_and_type()
                         .ok_or("not a NameAndType")?;
 
-                    global_memory.load_class(class_info.name.to_owned())?;
-                    global_memory.link_class(class_info.name.to_owned())?;
-                    global_memory.init_class(class_info.name.to_owned())?;
+                    global_memory.ensure_class(class_info.name.as_str())?;
                     let type_descriptor = parse_method_descriptor(method_descriptor_text)?;
 
                     let mut nargs = vec![];
@@ -2341,9 +3359,7 @@ impl Thread {
                         .as_name_and_type()
                         .ok_or("not a NameAndType")?;
 
-                    global_memory.load_class(class_info.name.to_owned())?;
-                    global_memory.link_class(class_info.name.to_owned())?;
-                    global_memory.init_class(class_info.name.to_owned())?;
+                    global_memory.ensure_class(class_info.name.as_str())?;
 
                     let type_descriptor = parse_method_descriptor(method_descriptor_text)?;
                     println!("type_descriptor: {type_descriptor:?}");
@@ -2363,6 +3379,86 @@ impl Thread {
                     // FIXME: this probably doesnt handle longs correctly?
                     for narg in nargs.iter().enumerate() {
                         new_frame.local_variables[narg.0] = *narg.1;
+                    }
+                    current_frame.instruction_counter += 1;
+
+                    self.thread_memory.jvm_stack.push(new_frame)
+                }
+                // invokeinterface
+                0xb9 => {
+                    current_frame.instruction_counter += 1;
+                    let indexbyte1 = (*code_bytes
+                        .get(current_frame.instruction_counter)
+                        .ok_or("no bytes")?) as u16;
+                    current_frame.instruction_counter += 1;
+                    let indexbyte2 = (*code_bytes
+                        .get(current_frame.instruction_counter)
+                        .ok_or("no bytes")?) as u16;
+
+                    let index = (indexbyte1 << 8) | indexbyte2;
+
+                    current_frame.instruction_counter += 1;
+                    let count = *code_bytes
+                        .get(current_frame.instruction_counter)
+                        .ok_or("no bytes")?;
+
+                    current_frame.instruction_counter += 1;
+                    let shouldbezero = *code_bytes
+                        .get(current_frame.instruction_counter)
+                        .ok_or("no bytes")?;
+
+                    let (interface_info, name_and_type) = current_frame
+                        .constant_pool
+                        .clone()
+                        .upgrade()
+                        .ok_or("no constant_pool")?
+                        .pool
+                        .get((index - 1) as usize)
+                        .ok_or("expected ur mom")?
+                        .to_owned()
+                        .as_method_ref()
+                        .ok_or("not a field ref")?;
+                    let (name, method_descriptor_text) = name_and_type
+                        .as_name_and_type()
+                        .ok_or("not a NameAndType")?;
+
+                    let type_descriptor = parse_method_descriptor(method_descriptor_text)?;
+                    println!("name: {name} type_descriptor: {type_descriptor:?}");
+                    let mut nargs = vec![];
+
+                    // this loop is probably incorrect, as doubles and stuff take up 2 bytes
+                    for _ in 0..type_descriptor.parameter_descriptors.len() {
+                        let narg = current_frame
+                            .operand_stack
+                            .pop()
+                            .ok_or("nargs is not on the stack")?;
+                        nargs.insert(0, narg);
+                    }
+
+                    let objectref = current_frame
+                        .operand_stack
+                        .pop()
+                        .ok_or("value is not on the stack")?;
+
+                    let field_ref = global_memory
+                        .heap
+                        .data
+                        .get(objectref as usize)
+                        .ok_or(format!("object {objectref} not found on heap!"))?
+                        .field_descriptor
+                        .to_owned();
+                    let field_descriptor = parse_field_descriptor(&field_ref)?;
+                    let class_name = field_descriptor
+                        .field_type
+                        .as_class_instance()
+                        .ok_or("not a class instance")?;
+
+                    let mut new_frame =
+                        Frame::new(global_memory, class_name.to_owned(), name, type_descriptor)?;
+                    new_frame.local_variables[0] = objectref;
+                    // FIXME: this probably doesnt handle longs correctly?
+                    for narg in nargs.iter().enumerate() {
+                        new_frame.local_variables[narg.0 + 1] = *narg.1;
                     }
                     current_frame.instruction_counter += 1;
 
@@ -2392,17 +3488,15 @@ impl Thread {
                         .to_owned();
                     let class = constant.as_class().ok_or("ClassNotFound :(")?;
 
-                    global_memory.load_class(class.name.to_owned())?;
-                    global_memory.link_class(class.name.to_owned())?;
-                    global_memory.init_class(class.name.to_owned())?;
-
+                    global_memory.ensure_class(class.name.as_str())?;
                     let klass = global_memory
                         .method_area
                         .classes
                         .get(&class.name)
                         .ok_or("class not found in method area 3 :(")?;
 
-                    let objectref = global_memory.heap.allocate_class(klass);
+                    let objectref = global_memory.heap.allocate_klass(klass);
+                    println!("objectref new {}", objectref);
                     current_frame.operand_stack.push(objectref);
 
                     current_frame.instruction_counter += 1;
@@ -2422,6 +3516,7 @@ impl Thread {
 
                     // FIXME: get type from atype and put it in type field
                     let objectref = global_memory.heap.store("[B".to_string(), data);
+
                     println!("objectref newarray: {}", objectref);
                     current_frame.operand_stack.push(objectref);
 
@@ -2477,7 +3572,7 @@ impl Thread {
                     let field_info = parse_field_descriptor(&heap_item.field_descriptor)?;
                     if !matches!(field_info.field_type, FieldType::Array(_)) {
                         println!("{:?}", field_info.field_type);
-                        return Err("expected an array".into());
+                        return Err(format!("expected an array, found {field_info:?}").into());
                     }
                     let length = heap_item.data.len();
                     let length_bytes =
@@ -2485,9 +3580,153 @@ impl Thread {
                     current_frame.operand_stack.push(length_bytes);
                     current_frame.instruction_counter += 1;
                 }
-                // entermonitor
+                // athrow
+                0xbf => {
+                    let objectref = current_frame
+                        .operand_stack
+                        .pop()
+                        .ok_or("nothing to pop here")?;
+                    self.handle_exception(global_memory, objectref)?;
+                }
+                // checkcast
+                0xc0 => {
+                    current_frame.instruction_counter += 1;
+                    let indexbyte1 = (*code_bytes
+                        .get(current_frame.instruction_counter)
+                        .ok_or("no bytes")?) as u16;
+                    current_frame.instruction_counter += 1;
+                    let indexbyte2 = (*code_bytes
+                        .get(current_frame.instruction_counter)
+                        .ok_or("no bytes")?) as u16;
+                    let objectref = current_frame
+                        .operand_stack
+                        .pop()
+                        .ok_or("no item on the operand_stack")?;
+
+                    let index = ((indexbyte1 << 8) | indexbyte2) as usize;
+                    println!("index: {indexbyte1} {indexbyte2}");
+
+                    let constant = current_frame
+                        .constant_pool
+                        .clone()
+                        .upgrade()
+                        .ok_or("no constant_pool")?
+                        .pool
+                        .get(index - 1)
+                        .ok_or("expected ur mom _1")?
+                        .to_owned()
+                        .as_class()
+                        .ok_or("not a class constant")?
+                        .to_owned();
+
+                    current_frame.instruction_counter += 1;
+                    current_frame.operand_stack.push(objectref);
+                    // FIXME: this was the beginning of a implementation, but this seems to be to
+                    // complex for now
+                    // if objectref == 0 {
+                    //     current_frame.operand_stack.push(objectref)
+                    // } else {
+                    //     let typeof_objectref = parse_field_descriptor(
+                    //         &global_memory
+                    //             .heap
+                    //             .data
+                    //             .get(objectref as usize)
+                    //             .ok_or("item not on heap?")?
+                    //             .field_descriptor,
+                    //     )?;
+
+                    //     println!("{:?} {:?}", typeof_objectref, constant.name);
+                    //     if typeof_objectref.field_type.as_class_instance().is_some() {
+                    //         let typeof_objectref =
+                    //             typeof_objectref.field_type.as_class_instance().unwrap();
+                    //         if constant.name.starts_with("[") {
+                    //             // if T it's an array, S can't implement it
+                    //             global_memory.ensure_class("java/lang/ClassCastException")?;
+                    //             let exception_klass = global_memory
+                    //                 .method_area
+                    //                 .classes
+                    //                 .get("java/lang/ClassCastException")
+                    //                 .ok_or("class not found")?;
+                    //             let exception_ref =
+                    //                 global_memory.heap.allocate_klass(exception_klass);
+                    //             self.handle_exception(global_memory, exception_ref)?;
+                    //         } else {
+                    //             let resolved_class_or_interface = global_memory
+                    //                 .method_area
+                    //                 .classes
+                    //                 .get(&constant.name)
+                    //                 .ok_or("class not found")?
+                    //                 .as_instance_klass()
+                    //                 .ok_or("not an InstanceKlass")?;
+                    //             let is_interface = resolved_class_or_interface
+                    //                 .parsed_class
+                    //                 .as_ref()
+                    //                 .unwrap()
+                    //                 .access
+                    //                 .interface;
+
+                    //             if is_interface {
+                    //                 println!("{:?} {:?}", typeof_objectref, constant);
+                    //                 // FIXME
+                    //                 current_frame.operand_stack.push(objectref)
+                    //             } else {
+                    //                 todo!("let's implement this!");
+                    //             }
+                    //         }
+                    //     }
+                    // }
+                }
+                // instanceof 
+                0xc1 => {
+                    current_frame.instruction_counter += 1;
+                    let indexbyte1 = (*code_bytes
+                        .get(current_frame.instruction_counter)
+                        .ok_or("no bytes")?) as u16;
+                    current_frame.instruction_counter += 1;
+                    let indexbyte2 = (*code_bytes
+                        .get(current_frame.instruction_counter)
+                        .ok_or("no bytes")?) as u16;
+                    let objectref = current_frame
+                        .operand_stack
+                        .pop()
+                        .ok_or("no item on the operand_stack")?;
+
+                    let index = ((indexbyte1 << 8) | indexbyte2) as usize;
+                    println!("index: {indexbyte1} {indexbyte2}");
+
+                    let constant = current_frame
+                        .constant_pool
+                        .clone()
+                        .upgrade()
+                        .ok_or("no constant_pool")?
+                        .pool
+                        .get(index - 1)
+                        .ok_or("expected ur mom _1")?
+                        .to_owned()
+                        .as_class()
+                        .ok_or("not a class constant")?
+                        .to_owned();
+
+                    current_frame.operand_stack.push(0);
+                    current_frame.instruction_counter += 1;
+                    // FIXME: implement - see checkcast 
+                }
+                // monitorenter
                 0xc2 => {
                     // FIXME: Implement
+                    let value = current_frame
+                        .operand_stack
+                        .pop()
+                        .ok_or("no item on the operand_stack")?;
+                    current_frame.instruction_counter += 1;
+                }
+                // monitorexit
+                0xc3 => {
+                    // FIXME: Implement
+                    let value = current_frame
+                        .operand_stack
+                        .pop()
+                        .ok_or("no item on the operand_stack")?;
                     current_frame.instruction_counter += 1;
                 }
                 // ifnull
@@ -2580,6 +3819,7 @@ impl VM {
                 thread_memory: ThreadMemory {
                     jvm_stack: Vec::new(),
                 },
+                is_throwing: false,
             },
         };
 
@@ -2588,24 +3828,43 @@ impl VM {
         return vmref;
     }
 
+    fn initialize_java_lang_classes(&mut self) -> Result<(), Box<dyn Error>> {
+        self.global_memory.ensure_class("java/lang/Class")?;
+
+        self.global_memory.ensure_array("[Z".to_owned())?;
+        self.global_memory.ensure_array("[B".to_owned())?;
+        self.global_memory.ensure_array("[S".to_owned())?;
+        self.global_memory.ensure_array("[C".to_owned())?;
+        self.global_memory.ensure_array("[I".to_owned())?;
+        self.global_memory.ensure_array("[J".to_owned())?;
+        self.global_memory.ensure_array("[F".to_owned())?;
+        self.global_memory.ensure_array("[D".to_owned())?;
+        self.global_memory
+            .ensure_array("[Ljava/lang/Object;".to_owned())?;
+
+        self.global_memory.ensure_class("java/lang/Object")?;
+        self.global_memory.ensure_class("java/lang/String")?;
+        self.global_memory.ensure_class("java/lang/System")?;
+        // init system
+        let current_frame = Frame::new(
+            &mut self.global_memory,
+            "java/lang/System".to_owned(),
+            "initPhase1".into(),
+            MethodDescriptor {
+                parameter_descriptors: vec![],
+                return_descriptor: crate::parse::ReturnDescriptor::VoidDescriptor,
+            },
+        )?;
+        self.main_thread.thread_memory.jvm_stack.push(current_frame);
+        self.main_thread.run(&mut self.global_memory)?;
+
+        Ok(())
+    }
+
     fn run(&mut self, name: String) -> Result<(), Box<dyn Error>> {
-        self.global_memory
-            .load_class("java/lang/Class".to_owned())?;
-        self.global_memory
-            .link_class("java/lang/Class".to_owned())?;
-        self.global_memory
-            .init_class("java/lang/Class".to_owned())?;
+        self.initialize_java_lang_classes()?;
 
-        self.global_memory
-            .load_class("java/lang/String".to_owned())?;
-        self.global_memory
-            .link_class("java/lang/String".to_owned())?;
-        self.global_memory
-            .init_class("java/lang/String".to_owned())?;
-
-        self.global_memory.load_class(name.to_owned())?;
-        self.global_memory.link_class(name.to_owned())?;
-        self.global_memory.init_class(name.to_owned())?;
+        self.global_memory.ensure_class(name.as_str())?;
 
         let current_frame = Frame::new(
             &mut self.global_memory,

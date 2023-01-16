@@ -16,20 +16,23 @@ pub struct ClassAccess {
     pub interface: bool,
 }
 
-fn parse_access_flags(access_flags: u16) -> ClassAccess {
-    let public = access_flags & 0x0001 == 0x0001;
-    let is_final = access_flags & 0x0010 == 0x0010;
-    let is_super = access_flags & 0x0020 == 0x0020;
-    let interface = access_flags & 0x0200 == 0x0200;
-    // TODO: add remaining access flags!
+impl ClassAccess {
+    fn new(access_flags: u16) -> ClassAccess {
+        let public = access_flags & 0x0001 == 0x0001;
+        let is_final = access_flags & 0x0010 == 0x0010;
+        let is_super = access_flags & 0x0020 == 0x0020;
+        let interface = access_flags & 0x0200 == 0x0200;
+        // TODO: add remaining access flags!
 
-    return ClassAccess {
-        public,
-        is_final,
-        is_super,
-        interface,
-    };
+        return ClassAccess {
+            public,
+            is_final,
+            is_super,
+            interface,
+        };
+    }
 }
+
 
 #[derive(Debug, Clone)]
 pub struct FieldAccess {
@@ -390,14 +393,14 @@ fn parse_field(
         .get((field_info.name_index - 1) as usize)
         .ok_or("failed to get name")?;
     let name = parse_utf8_info(name_info);
-    println!("name: {name}");
+    // println!("name: {name}");
     let descriptor_info = constant_pool
         .get((field_info.descriptor_index - 1) as usize)
         .expect("descriptor to be present");
     let descriptor_text = parse_utf8_info(descriptor_info);
     let descriptor = parse_field_descriptor(&descriptor_text)?;
 
-    println!("descriptor: {descriptor:?}");
+    // println!("descriptor: {descriptor:?}");
 
     let mut attributes = vec![];
     for attribute_info in field_info.attributes.iter() {
@@ -447,10 +450,17 @@ impl FieldType {
             None
         }
     }
+    pub fn as_array(&self) -> Option<&FieldType> {
+        if let Self::Array(v) = self {
+            Some(&v)
+        } else {
+            None
+        }
+    }
 }
 
 fn parse_field_type(chars: &mut Chars) -> Result<FieldType, Box<dyn Error>> {
-    println!("chars: {chars:?}");
+    // println!("chars: {chars:?}");
     match chars
         .nth(0)
         .ok_or("failed to get first char of field_type")?
@@ -472,15 +482,39 @@ fn parse_field_type(chars: &mut Chars) -> Result<FieldType, Box<dyn Error>> {
 }
 
 #[derive(Debug, Clone)]
+pub struct ExceptionTableItem {
+    pub start_pc: usize,
+    pub end_pc: usize,
+    pub handler_pc: usize,
+    pub catch_type: usize,
+}
+
+#[derive(Debug, Clone)]
 pub enum Attribute {
-    Code { bytes: Vec<u8> },
+    Code {
+        max_stack: usize,
+        max_locals: usize,
+        bytes: Vec<u8>,
+        exception_table: Vec<ExceptionTableItem>,
+    },
     Placeholder,
 }
 
 impl Attribute {
-    pub fn as_code(&self) -> Option<&Vec<u8>> {
-        if let Self::Code { bytes } = self {
-            Some(bytes)
+    pub fn as_code(&self) -> Option<(Vec<u8>, usize, usize, Vec<ExceptionTableItem>)> {
+        if let Self::Code {
+            bytes,
+            max_stack,
+            max_locals,
+            exception_table,
+        } = self
+        {
+            Some((
+                bytes.to_owned(),
+                *max_stack,
+                *max_locals,
+                exception_table.to_owned(),
+            ))
         } else {
             None
         }
@@ -496,7 +530,7 @@ fn parse_attribute(
         .ok_or("expect name to be present")
         .unwrap();
     let name = parse_utf8_info(name_info);
-    println!("attribute name: {name}");
+    // println!("attribute name: {name}");
 
     if name == "Code" {
         let mut csr = Cursor::new(attribute_info.info.to_owned());
@@ -507,10 +541,29 @@ fn parse_attribute(
         let mut code_bytes = (&mut csr).take(code_length.into());
         let mut code = vec![];
         code_bytes.read_to_end(&mut code)?;
-        println!("code: {code:?}");
-        // TODO: exception table
+        // println!("code: {code:?}");
+        let mut et = vec![];
+        let et_length = csr.read_u16::<BigEndian>()?;
+        for _ in 0..et_length {
+            let start_pc = csr.read_u16::<BigEndian>()?;
+            let end_pc = csr.read_u16::<BigEndian>()?;
+            let handler_pc = csr.read_u16::<BigEndian>()?;
+            let catch_type = csr.read_u16::<BigEndian>()?;
+            et.push(ExceptionTableItem {
+                start_pc: start_pc as usize,
+                end_pc: end_pc as usize,
+                handler_pc: handler_pc as usize,
+                catch_type: catch_type as usize,
+            })
+        }
+
         // TODO: attributes
-        return Ok(Attribute::Code { bytes: code });
+        return Ok(Attribute::Code {
+            max_stack: max_stack as usize,
+            max_locals: max_locals as usize,
+            bytes: code,
+            exception_table: et,
+        });
     }
     Ok(Attribute::Placeholder)
 }
@@ -570,14 +623,14 @@ fn parse_method(
         .get((field_info.name_index - 1) as usize)
         .ok_or("failed to get name")?;
     let name = parse_utf8_info(name_info);
-    println!("name: {name}");
+    // println!("name: {name}");
     let descriptor_info = constant_pool
         .get((field_info.descriptor_index - 1) as usize)
         .expect("descriptor to be present");
     let descriptor_text = parse_utf8_info(descriptor_info);
     let descriptor = parse_method_descriptor(descriptor_text)?;
 
-    println!("descriptor: {descriptor:?}");
+    // println!("descriptor: {descriptor:?}");
 
     let mut attributes = vec![];
     for attribute_info in field_info.attributes.iter() {
@@ -606,10 +659,10 @@ pub struct Class {
 }
 
 pub fn parse(class_file: DeserializedClassFile) -> Result<Class, Box<dyn Error>> {
-    println!("access_flags: 0x{:04x}", class_file.access_flags);
+    // println!("access_flags: 0x{:04x}", class_file.access_flags);
 
-    let access = parse_access_flags(class_file.access_flags);
-    println!("{access:?}");
+    let access = ClassAccess::new(class_file.access_flags);
+    // println!("{access:?}");
 
     let mut constant_pool = vec![Constant::Placeholder; class_file.constant_pool.len()];
 
@@ -621,7 +674,7 @@ pub fn parse(class_file: DeserializedClassFile) -> Result<Class, Box<dyn Error>>
     .as_class()
     .ok_or("no  class")?
     .to_owned();
-    println!("this_class: {this_class:?}");
+    // println!("this_class: {this_class:?}");
 
     let super_class = if (class_file.super_class == 0) {
         // if super_class is 0, this is most likely java.lang.Object
@@ -649,7 +702,7 @@ pub fn parse(class_file: DeserializedClassFile) -> Result<Class, Box<dyn Error>>
         .as_class()
         .ok_or("no class")?
         .to_owned();
-        println!("{interface:?}");
+        // println!("{interface:?}");
         interfaces.push(interface);
     }
 
@@ -675,7 +728,7 @@ pub fn parse(class_file: DeserializedClassFile) -> Result<Class, Box<dyn Error>>
                 parse_or_get_constant(&mut constant_pool, &class_file.constant_pool, i as u16 + 1)?;
         }
     }
-    println!("constants: {:?}", constant_pool);
+    // println!("constants: {:?}", constant_pool);
 
     let class = Class {
         access,
@@ -688,7 +741,7 @@ pub fn parse(class_file: DeserializedClassFile) -> Result<Class, Box<dyn Error>>
         attributes: vec![],
     };
 
-    println!("class {:?}", class);
+    // println!("class {:?}", class);
 
     Ok(class)
 }

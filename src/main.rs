@@ -6,6 +6,7 @@ use run::run;
 mod deserialize;
 mod parse;
 mod run;
+mod native;
 
 fn main() -> Result<(), Box<dyn Error>> {
     let cli = clap::Command::new("matebabe")
