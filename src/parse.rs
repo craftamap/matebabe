@@ -593,8 +593,10 @@ pub fn parse_method_descriptor(
         parameter_descriptors.push(field_type);
     }
 
+    let close = chars.next();
+
     // parse_return_descriptor
-    let return_descriptor = if chars.to_owned().next().unwrap() != 'V' {
+    let return_descriptor = if chars.to_owned().next().unwrap() == 'V' {
         ReturnDescriptor::VoidDescriptor
     } else {
         ReturnDescriptor::FieldType(parse_field_type(&mut chars)?)
