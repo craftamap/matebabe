@@ -135,8 +135,8 @@ impl Frame {
             running_native: false,
         };
         // println!(
-            // "new frame for method {}.{}({:?}): {:?}",
-            // class_name, method_name, type_descriptor, current_frame
+        // "new frame for method {}.{}({:?}): {:?}",
+        // class_name, method_name, type_descriptor, current_frame
         // );
         return Ok(current_frame);
     }
@@ -676,9 +676,9 @@ impl InstanceKlass {
         searched_field_name: String,
     ) -> Result<(String, usize), Box<dyn Error>> {
         // println!(
-            // "searching for {} in {}",
-            // searched_field_name,
-            // self.get_name()
+        // "searching for {} in {}",
+        // searched_field_name,
+        // self.get_name()
         // );
         if self
             .static_fields
@@ -1218,7 +1218,6 @@ fn run_native_methods(
                 put("user.home".to_owned(), ".".to_owned())?;
                 put("user.dir".to_owned(), ".".to_owned())?;
                 put("user.name".to_owned(), ".".to_owned())?;
-                put("file.encoding".to_owned(), "UTF-8".to_owned())?;
                 put("file.separator".to_owned(), "/".to_owned())?;
                 put("path.separator".to_owned(), ":".to_owned())?;
                 put("file.encoding".to_owned(), "UTF-8".to_owned())?;
@@ -2811,9 +2810,9 @@ impl Thread {
                         .ok_or("no item on the operand_stack")?
                         as u64;
 
-                    let value1 = Cursor::new(((value1_part1 << 16) | value1_part2).to_be_bytes())
+                    let value1 = Cursor::new(((value1_part1 << 32) | value1_part2).to_be_bytes())
                         .read_i64::<BigEndian>()?;
-                    let value2 = Cursor::new(((value2_part1 << 16) | value2_part2).to_be_bytes())
+                    let value2 = Cursor::new(((value2_part1 << 32) | value2_part2).to_be_bytes())
                         .read_i64::<BigEndian>()?;
 
                     let result = value1 + value2;
@@ -2848,9 +2847,9 @@ impl Thread {
                         .ok_or("no item on the operand_stack")?
                         as u64;
 
-                    let value1 = Cursor::new(((value1_part1 << 16) | value1_part2).to_be_bytes())
+                    let value1 = Cursor::new(((value1_part1 << 32) | value1_part2).to_be_bytes())
                         .read_f64::<BigEndian>()?;
-                    let value2 = Cursor::new(((value2_part1 << 16) | value2_part2).to_be_bytes())
+                    let value2 = Cursor::new(((value2_part1 << 32) | value2_part2).to_be_bytes())
                         .read_f64::<BigEndian>()?;
 
                     let result = value1 + value2;
@@ -4970,19 +4969,17 @@ pub fn run(filename: String) {
     let rt = VM::new();
     let class_name = filename;
     let result = (*rt).borrow_mut().run(class_name.to_owned());
-    if (result.is_err()) {
-        // println!("heap dump: ",);
-        // for (idx, heap_item) in rt
-        //     .deref()
-        //     .borrow()
-        //     .global_memory
-        //     .heap
-        //     .data
-        //     .iter()
-        //     .enumerate()
-        // {
-        //     println!("  idx: {} item: {:?}", idx, heap_item)
-        // }
-        result.unwrap();
+    println!("heap dump: ",);
+    for (idx, heap_item) in rt
+        .deref()
+        .borrow()
+        .global_memory
+        .heap
+        .data
+        .iter()
+        .enumerate()
+    {
+        println!("  idx: {} item: {:?}", idx, heap_item)
     }
+    result.unwrap();
 }
